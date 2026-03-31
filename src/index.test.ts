@@ -17,6 +17,8 @@ interface ClaudeCredentials {
   accessToken: string
   refreshToken: string
   expiresAt: number
+  accountUuid?: string
+  userID?: string
 }
 
 type TestAuthLoader = (
@@ -35,6 +37,40 @@ interface Account {
   label: string
   source: string
   credentials: ClaudeCredentials
+}
+
+function getRequestUrl(
+  input: RequestInfo | URL | undefined,
+): string | undefined {
+  if (!input) {
+    return undefined
+  }
+
+  if (input instanceof Request) {
+    return input.url
+  }
+
+  if (input instanceof URL) {
+    return input.toString()
+  }
+
+  return input
+}
+
+function getExpectedStainlessOs(platform: NodeJS.Platform): string {
+  switch (platform) {
+    case "darwin":
+      return "MacOS"
+    case "win32":
+    case "cygwin":
+      return "Windows"
+    case "linux":
+      return "Linux"
+    case "haiku":
+      return "Haiku"
+    default:
+      return platform
+  }
 }
 
 // Mirrors authorize()'s account-resolution logic
@@ -124,6 +160,7 @@ const SOURCE_FILES = [
   "betas.ts",
   "model-config.ts",
   "transforms.ts",
+  "workload.ts",
   "credentials.ts",
   "logger.ts",
 ] as const
@@ -143,6 +180,11 @@ async function copySourceFiles(tempDir: string): Promise<void> {
 
 async function loadHelpersWithCountingKeychain(
   initialExpiresAt: number,
+  credentialOverrides: Partial<ClaudeCredentials> = {},
+  stateIdentity: { accountUuid?: string; userID?: string } | null = {
+    accountUuid: "acct-state-default",
+    userID: "device-state-default",
+  },
 ): Promise<{
   helpersModule: typeof import("./index.ts")
   keychainModule: { __getReadCount: () => number }
@@ -151,14 +193,22 @@ async function loadHelpersWithCountingKeychain(
   const tempKeychain = join(tempDir, "keychain.ts")
 
   await copySourceFiles(tempDir)
+  const credentialsLiteral = JSON.stringify(
+    {
+      accessToken: "token",
+      refreshToken: "refresh",
+      expiresAt: initialExpiresAt,
+      ...credentialOverrides,
+    },
+    null,
+    2,
+  )
+  const stateIdentityLiteral = JSON.stringify(stateIdentity, null, 2)
   await writeFile(
     tempKeychain,
     `let readCount = 0
-let credentials = {
-  accessToken: "token",
-  refreshToken: "refresh",
-  expiresAt: ${initialExpiresAt}
-}
+let credentials = ${credentialsLiteral}
+let stateIdentity = ${stateIdentityLiteral}
 
 export function readAllClaudeAccounts() {
   readCount += 1
@@ -168,6 +218,10 @@ export function readAllClaudeAccounts() {
 export function refreshAccount(source) {
   readCount += 1
   return credentials
+}
+
+export function readClaudeStateIdentity() {
+  return stateIdentity
 }
 
 export function buildAccountLabels(creds) {
@@ -237,6 +291,7 @@ const realFs = {
 }
 
 let helpers: typeof import("./index.ts")
+let workloadHelpers: typeof import("./workload.ts")
 
 describe("exported helpers", () => {
   before(async () => {
@@ -248,17 +303,21 @@ describe("exported helpers", () => {
       tempKeychain,
       `export function readAllClaudeAccounts() { return [{ label: "Account 1", source: "Claude Code-credentials", credentials: { accessToken: "token", refreshToken: "refresh", expiresAt: 1 } }] }
 export function refreshAccount() { return null }
+export function readClaudeStateIdentity() { return { accountUuid: "acct-state-default", userID: "device-state-default" } }
 export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account \${i + 1}\`) }
 `,
       "utf8",
     )
 
     helpers = await import(pathToFileURL(join(tempDir, "index.ts")).href)
+    workloadHelpers = await import(
+      pathToFileURL(join(tempDir, "workload.ts")).href
+    )
   })
 
   it("buildRequestHeaders sets auth headers and strips x-api-key", () => {
     const headers = helpers.buildRequestHeaders(
-      "https://api.anthropic.com/v1/messages",
+      "https://api.anthropic.com/v1/messages?beta=true",
       {
         headers: {
           "anthropic-beta": "custom-beta",
@@ -268,68 +327,142 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       },
       "access-token",
       "claude-sonnet-4-6",
+      undefined,
+      {
+        clientRequestId: "request-123",
+        sessionId: "session-123",
+      },
     )
 
     assert.equal(headers.get("authorization"), "Bearer access-token")
+    assert.equal(headers.get("accept"), "application/json")
     assert.equal(headers.get("x-api-key"), null)
     assert.equal(headers.get("x-custom"), "keep-me")
     assert.ok(headers.get("anthropic-beta")?.includes("custom-beta"))
     assert.ok(
-      headers.get("x-anthropic-billing-header")?.includes("claude-sonnet-4-6"),
+      headers.get("anthropic-beta")?.includes("redact-thinking-2026-02-12"),
     )
-  })
-
-  it("getBillingHeader includes version and model", () => {
-    const header = helpers.getBillingHeader("claude-opus-4-1")
     assert.ok(
-      header.includes(`cc_version=${modelConfig.ccVersion}.claude-opus-4-1`),
+      headers.get("anthropic-beta")?.includes("advanced-tool-use-2025-11-20"),
     )
-    assert.ok(header.includes("cc_entrypoint=cli"))
+    assert.ok(headers.get("anthropic-beta")?.includes("effort-2025-11-24"))
+    assert.equal(headers.get("x-anthropic-billing-header"), null)
+    assert.equal(
+      headers.get("anthropic-dangerous-direct-browser-access"),
+      "true",
+    )
+    assert.equal(headers.get("anthropic-version"), "2023-06-01")
+    assert.equal(headers.get("content-type"), "application/json")
+    assert.equal(
+      headers.get("user-agent"),
+      `claude-cli/${modelConfig.ccVersion} (external, cli)`,
+    )
+    assert.equal(headers.get("x-app"), "cli")
+    assert.equal(headers.get("x-claude-code-session-id"), "session-123")
+    assert.equal(headers.get("x-client-request-id"), "request-123")
+    assert.equal(headers.get("x-stainless-arch"), process.arch)
+    assert.equal(headers.get("x-stainless-lang"), "js")
+    assert.equal(
+      headers.get("x-stainless-os"),
+      getExpectedStainlessOs(process.platform),
+    )
+    assert.equal(headers.get("x-stainless-package-version"), "0.74.0")
+    assert.equal(headers.get("x-stainless-retry-count"), "0")
+    assert.equal(headers.get("x-stainless-runtime"), "node")
+    assert.equal(headers.get("x-stainless-runtime-version"), process.version)
+    assert.equal(headers.get("x-stainless-timeout"), "600")
   })
 
-  it("buildRequestHeaders uses ANTHROPIC_CLI_VERSION for user-agent", () => {
+  it("buildRequestHeaders strips unsupported effort beta for haiku models", () => {
+    const headers = helpers.buildRequestHeaders(
+      "https://api.anthropic.com/v1/messages?beta=true",
+      {
+        headers: {
+          "anthropic-beta":
+            "effort-2025-11-24,structured-outputs-2025-12-15,custom-beta",
+        },
+      },
+      "access-token",
+      "claude-haiku-4-5-20251001",
+      undefined,
+      {
+        clientRequestId: "request-123",
+        sessionId: "session-123",
+      },
+    )
+
+    assert.equal(
+      headers.get("anthropic-beta")?.includes("effort-2025-11-24"),
+      false,
+    )
+    assert.ok(
+      headers.get("anthropic-beta")?.includes("structured-outputs-2025-12-15"),
+    )
+    assert.ok(headers.get("anthropic-beta")?.includes("custom-beta"))
+  })
+
+  it("buildRequestHeaders ignores ANTHROPIC_* user-agent overrides", () => {
     process.env.ANTHROPIC_CLI_VERSION = "9.9.9"
-    try {
-      const headers = helpers.buildRequestHeaders(
-        "https://api.anthropic.com/v1/messages",
-        { headers: {} },
-        "token",
-        "claude-sonnet-4-6",
-      )
-      assert.ok(
-        headers.get("user-agent")?.includes("9.9.9"),
-        `Expected user-agent to include 9.9.9, got: ${headers.get("user-agent")}`,
-      )
-    } finally {
-      delete process.env.ANTHROPIC_CLI_VERSION
-    }
-  })
-
-  it("buildRequestHeaders uses ANTHROPIC_USER_AGENT when set", () => {
     process.env.ANTHROPIC_USER_AGENT = "custom-agent/1.0"
     try {
       const headers = helpers.buildRequestHeaders(
-        "https://api.anthropic.com/v1/messages",
+        "https://api.anthropic.com/v1/messages?beta=true",
         { headers: {} },
         "token",
         "claude-sonnet-4-6",
+        undefined,
+        {
+          clientRequestId: "request-123",
+          sessionId: "session-123",
+        },
       )
-      assert.equal(headers.get("user-agent"), "custom-agent/1.0")
+      assert.equal(
+        headers.get("user-agent"),
+        `claude-cli/${modelConfig.ccVersion} (external, cli)`,
+      )
     } finally {
+      delete process.env.ANTHROPIC_CLI_VERSION
       delete process.env.ANTHROPIC_USER_AGENT
     }
   })
 
-  it("getBillingHeader uses ANTHROPIC_CLI_VERSION when set", () => {
-    process.env.ANTHROPIC_CLI_VERSION = "9.9.9"
+  it("buildRequestHeaders appends workload suffix to user-agent when workload is set", () => {
+    const originalUserType = process.env.USER_TYPE
+    const originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
+    delete process.env.USER_TYPE
+    delete process.env.CLAUDE_CODE_ENTRYPOINT
+
     try {
-      const header = helpers.getBillingHeader("claude-opus-4-1")
-      assert.ok(
-        header.includes("cc_version=9.9.9"),
-        `Expected billing header to include 9.9.9, got: ${header}`,
+      const headers = workloadHelpers.runWithWorkload("cron", () =>
+        helpers.buildRequestHeaders(
+          "https://api.anthropic.com/v1/messages?beta=true",
+          { headers: {} },
+          "token",
+          "claude-sonnet-4-6",
+          undefined,
+          {
+            clientRequestId: "request-123",
+            sessionId: "session-123",
+          },
+        ),
+      )
+
+      assert.equal(
+        headers.get("user-agent"),
+        `claude-cli/${modelConfig.ccVersion} (external, cli, workload/cron)`,
       )
     } finally {
-      delete process.env.ANTHROPIC_CLI_VERSION
+      if (typeof originalUserType === "string") {
+        process.env.USER_TYPE = originalUserType
+      } else {
+        delete process.env.USER_TYPE
+      }
+
+      if (typeof originalEntrypoint === "string") {
+        process.env.CLAUDE_CODE_ENTRYPOINT = originalEntrypoint
+      } else {
+        delete process.env.CLAUDE_CODE_ENTRYPOINT
+      }
     }
   })
 
@@ -552,7 +685,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
-  it("auth fetch forwards original input URL unchanged", async () => {
+  it("auth fetch normalizes Anthropic messages URL to the official beta route", async () => {
     const originalNow = Date.now
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
@@ -594,9 +727,351 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
       })
 
-      assert.equal(forwardedInput, originalInput)
+      assert.equal(
+        getRequestUrl(forwardedInput),
+        "https://api.anthropic.com/v1/messages?beta=true",
+      )
     } finally {
       Date.now = originalNow
+      globalThis.setInterval = originalSetInterval
+      globalThis.fetch = originalFetch
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+    }
+  })
+
+  it("auth fetch injects billing text into system and W6H-style metadata.user_id", async () => {
+    const originalSetInterval = globalThis.setInterval
+    const originalHome = process.env.HOME
+    const originalFetch = globalThis.fetch
+    const originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    process.env.HOME = tempHome
+    delete process.env.CLAUDE_CODE_ENTRYPOINT
+    globalThis.setInterval = (() => ({
+      unref() {},
+    })) as unknown as typeof setInterval
+
+    let capturedInit: RequestInit | undefined
+
+    try {
+      const { helpersModule } = await loadHelpersWithCountingKeychain(
+        Date.now() + 10 * 60_000,
+        {
+          accountUuid: "acct-from-credentials",
+          userID: "device-from-credentials",
+        },
+        {
+          accountUuid: "acct-123",
+          userID: "device-456",
+        },
+      )
+      globalThis.fetch = (async (
+        _input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => {
+        capturedInit = init
+        return new Response("ok")
+      }) as typeof fetch
+
+      const plugin = await helpersModule.default({} as never)
+      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
+      const authConfig = await typedPlugin.auth!.loader!(
+        async () => ({
+          type: "oauth",
+          refresh: "refresh",
+          access: "access",
+          expires: Date.now() + 60_000,
+        }),
+        { models: {} },
+      )
+
+      await authConfig.fetch(
+        "https://api.anthropic.com/v1/messages?beta=true",
+        {
+          method: "POST",
+          headers: {
+            "anthropic-beta": "effort-2025-11-24,structured-outputs-2025-12-15",
+          },
+          body: JSON.stringify({
+            output_config: {
+              effort: "medium",
+              format: {
+                type: "json_schema",
+                schema: {
+                  type: "object",
+                  properties: { title: { type: "string" } },
+                  required: ["title"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            temperature: 1,
+            max_tokens: 32000,
+            tools: [],
+            stream: true,
+            metadata: { trace_id: "trace-1" },
+            system: "Existing system",
+            model: "claude-haiku-4-5-20251001",
+            messages: [{ role: "user", content: "Hello from request body" }],
+          }),
+        },
+      )
+
+      assert.ok(capturedInit)
+      const headers = new Headers(capturedInit.headers)
+      assert.equal(headers.get("x-anthropic-billing-header"), null)
+      assert.equal(headers.get("accept"), "application/json")
+      assert.equal(
+        headers.get("anthropic-dangerous-direct-browser-access"),
+        "true",
+      )
+      assert.equal(headers.get("anthropic-version"), "2023-06-01")
+      assert.equal(headers.get("content-type"), "application/json")
+      assert.equal(headers.get("x-app"), "cli")
+      assert.equal(headers.get("x-stainless-arch"), process.arch)
+      assert.equal(headers.get("x-stainless-lang"), "js")
+      assert.equal(headers.get("x-stainless-package-version"), "0.74.0")
+      assert.equal(headers.get("x-stainless-retry-count"), "0")
+      assert.equal(headers.get("x-stainless-runtime"), "node")
+      assert.equal(headers.get("x-stainless-runtime-version"), process.version)
+      assert.equal(headers.get("x-stainless-timeout"), "600")
+      assert.ok(
+        headers.get("anthropic-beta")?.includes("redact-thinking-2026-02-12"),
+      )
+      assert.ok(
+        headers.get("anthropic-beta")?.includes("advanced-tool-use-2025-11-20"),
+      )
+      assert.equal(
+        headers.get("anthropic-beta")?.includes("effort-2025-11-24"),
+        false,
+      )
+      assert.ok(
+        headers
+          .get("anthropic-beta")
+          ?.includes("structured-outputs-2025-12-15"),
+      )
+      assert.match(
+        String(headers.get("x-client-request-id")),
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+      )
+      assert.match(
+        String(headers.get("x-claude-code-session-id")),
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+      )
+
+      const rawBody = String(capturedInit.body)
+      const parsed = JSON.parse(rawBody) as {
+        metadata: { user_id: string }
+        output_config: {
+          effort?: string
+          format: { type: string }
+        }
+        temperature: number
+        tools: unknown[]
+        system: Array<{ text: string; type: string }>
+        stream: boolean
+      }
+      assert.deepEqual(
+        Object.keys(JSON.parse(rawBody) as Record<string, unknown>),
+        [
+          "model",
+          "messages",
+          "system",
+          "tools",
+          "metadata",
+          "max_tokens",
+          "temperature",
+          "output_config",
+          "stream",
+        ],
+      )
+      assert.ok(
+        /^x-anthropic-billing-header: cc_version=2\.1\.88\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$/.test(
+          parsed.system[0].text,
+        ),
+      )
+      assert.deepEqual(parsed.system[1], {
+        type: "text",
+        text: "Existing system",
+      })
+      assert.deepEqual(parsed.tools, [])
+      assert.equal(parsed.temperature, 1)
+      assert.equal(parsed.output_config.effort, undefined)
+      assert.equal(parsed.output_config.format.type, "json_schema")
+
+      const metadata = JSON.parse(parsed.metadata.user_id) as {
+        account_uuid: string
+        device_id: string
+        session_id: string
+      }
+      assert.equal(metadata.device_id, "device-456")
+      assert.equal(metadata.account_uuid, "acct-123")
+      assert.equal(headers.get("x-claude-code-session-id"), metadata.session_id)
+      assert.match(
+        metadata.session_id,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+      )
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      globalThis.fetch = originalFetch
+      if (typeof originalEntrypoint === "string") {
+        process.env.CLAUDE_CODE_ENTRYPOINT = originalEntrypoint
+      } else {
+        delete process.env.CLAUDE_CODE_ENTRYPOINT
+      }
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+    }
+  })
+
+  it("auth fetch omits attribution header text when CLAUDE_CODE_ATTRIBUTION_HEADER is falsy", async () => {
+    const originalSetInterval = globalThis.setInterval
+    const originalHome = process.env.HOME
+    const originalFetch = globalThis.fetch
+    const originalAttribution = process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
+    const originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    process.env.HOME = tempHome
+    process.env.CLAUDE_CODE_ATTRIBUTION_HEADER = "0"
+    delete process.env.CLAUDE_CODE_ENTRYPOINT
+    globalThis.setInterval = (() => ({
+      unref() {},
+    })) as unknown as typeof setInterval
+
+    let capturedInit: RequestInit | undefined
+
+    try {
+      const { helpersModule } = await loadHelpersWithCountingKeychain(
+        Date.now() + 10 * 60_000,
+        {
+          accountUuid: "acct-from-credentials",
+          userID: "device-from-credentials",
+        },
+        {
+          accountUuid: "acct-123",
+          userID: "device-456",
+        },
+      )
+      globalThis.fetch = (async (
+        _input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => {
+        capturedInit = init
+        return new Response("ok")
+      }) as typeof fetch
+
+      const plugin = await helpersModule.default({} as never)
+      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
+      const authConfig = await typedPlugin.auth!.loader!(
+        async () => ({
+          type: "oauth",
+          refresh: "refresh",
+          access: "access",
+          expires: Date.now() + 60_000,
+        }),
+        { models: {} },
+      )
+
+      await authConfig.fetch(
+        "https://api.anthropic.com/v1/messages?beta=true",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            system: "Existing system",
+            model: "claude-haiku-4-5-20251001",
+            messages: [{ role: "user", content: "Hello from request body" }],
+          }),
+        },
+      )
+
+      assert.ok(capturedInit)
+      const parsed = JSON.parse(String(capturedInit.body)) as {
+        system: string
+      }
+      assert.equal(parsed.system, "Existing system")
+    } finally {
+      globalThis.setInterval = originalSetInterval
+      globalThis.fetch = originalFetch
+      if (typeof originalAttribution === "string") {
+        process.env.CLAUDE_CODE_ATTRIBUTION_HEADER = originalAttribution
+      } else {
+        delete process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
+      }
+      if (typeof originalEntrypoint === "string") {
+        process.env.CLAUDE_CODE_ENTRYPOINT = originalEntrypoint
+      } else {
+        delete process.env.CLAUDE_CODE_ENTRYPOINT
+      }
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+    }
+  })
+
+  it("auth fetch fails when official Claude device_id is unavailable", async () => {
+    const originalSetInterval = globalThis.setInterval
+    const originalHome = process.env.HOME
+    const originalFetch = globalThis.fetch
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    process.env.HOME = tempHome
+    globalThis.setInterval = (() => ({
+      unref() {},
+    })) as unknown as typeof setInterval
+
+    let fetchCalled = false
+
+    try {
+      const { helpersModule } = await loadHelpersWithCountingKeychain(
+        Date.now() + 10 * 60_000,
+        {
+          accountUuid: "acct-456",
+        },
+        null,
+      )
+      globalThis.fetch = (async (
+        _input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => {
+        void init
+        fetchCalled = true
+        return new Response("ok")
+      }) as typeof fetch
+
+      const plugin = await helpersModule.default({} as never)
+      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
+      const authConfig = await typedPlugin.auth!.loader!(
+        async () => ({
+          type: "oauth",
+          refresh: "refresh",
+          access: "access",
+          expires: Date.now() + 60_000,
+        }),
+        { models: {} },
+      )
+
+      await assert.rejects(
+        authConfig.fetch("https://api.anthropic.com/v1/messages?beta=true", {
+          method: "POST",
+          body: JSON.stringify({
+            model: "claude-haiku-4-5",
+            messages: [
+              { role: "user", content: "No official user id present" },
+            ],
+          }),
+        }),
+        /Claude Code official device_id is unavailable/u,
+      )
+      assert.equal(fetchCalled, false)
+    } finally {
       globalThis.setInterval = originalSetInterval
       globalThis.fetch = originalFetch
       if (typeof originalHome === "string") {

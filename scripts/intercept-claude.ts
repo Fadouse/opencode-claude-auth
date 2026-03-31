@@ -60,6 +60,8 @@ const ALL_MODELS = [
 // ---------------------------------------------------------------------------
 interface CapturedRequest {
   model: string
+  url: string
+  method: string
   headers: Record<string, string>
   bodyKeys: string[]
   betas: string[]
@@ -124,6 +126,8 @@ function interceptModel(model: string): Promise<CapturedRequest | null> {
 
         const captured: CapturedRequest = {
           model,
+          url: req.url ?? "",
+          method: req.method ?? "",
           headers,
           bodyKeys: Object.keys(parsed).sort(),
           betas,
@@ -133,6 +137,13 @@ function interceptModel(model: string): Promise<CapturedRequest | null> {
           metadata: parsed.metadata,
           outputConfig: parsed.output_config,
         }
+
+        const isMessagesRequest =
+          (req.method ?? "").toUpperCase() === "POST" &&
+          /^\/v1\/messages(?:\?|$)/.test(req.url ?? "") &&
+          typeof parsed === "object" &&
+          parsed !== null &&
+          Object.keys(parsed).length > 0
 
         // Forward to real API
         const proxyOpts = {
@@ -146,8 +157,10 @@ function interceptModel(model: string): Promise<CapturedRequest | null> {
           res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers)
           proxyRes.pipe(res)
           proxyRes.on("end", () => {
-            clearTimeout(timer)
-            finish(captured)
+            if (isMessagesRequest) {
+              clearTimeout(timer)
+              finish(captured)
+            }
           })
         })
 
@@ -240,6 +253,7 @@ function printCapture(capture: CapturedRequest): {
 } {
   console.log(`\n${c.bold(`Model: ${capture.model}`)}`)
   console.log(`${"─".repeat(50)}`)
+  console.log(`\n  ${c.bold("Request")}: ${c.dim(`${capture.method} ${capture.url}`)}`)
 
   // Get our effective betas for this model
   const ourBetas = getOurBetas(capture.model)

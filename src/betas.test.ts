@@ -5,7 +5,7 @@ import {
   isLongContextError,
   supports1mContext,
 } from "./betas.ts"
-import { config, getModelOverride } from "./model-config.ts"
+import { config, getModelOverride, supportsEffort } from "./model-config.ts"
 
 describe("betas", () => {
   it("getModelBetas includes all baseBetas from config for sonnet 4.6", () => {
@@ -153,6 +153,13 @@ describe("betas", () => {
       !supports1mContext("claude-haiku-4-5"),
       "haiku does not support 1M",
     )
+  })
+
+  it("supportsEffort matches the official allowlist we model locally", () => {
+    assert.equal(supportsEffort("claude-opus-4-5-20251001"), true)
+    assert.equal(supportsEffort("claude-sonnet-4-6"), true)
+    assert.equal(supportsEffort("claude-haiku-4-5-20251001"), false)
+    assert.equal(supportsEffort("claude-sonnet-4-5-20250929"), false)
   })
 
   it("getModelBetas filters out excluded betas when provided", () => {
