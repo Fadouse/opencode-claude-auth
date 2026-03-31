@@ -1,17 +1,19 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
-import { writeFileSync, mkdirSync, rmSync } from "node:fs"
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { buildAccountLabels } from "./keychain.ts"
+import { buildAccountLabels, readClaudeStateIdentity } from "./keychain.ts"
 
 // Mirrors the parseCredentials logic from keychain.ts for unit testing
 function parseCredentials(raw: string): {
   accessToken: string
   refreshToken: string
   expiresAt: number
+  accountUuid?: string
   subscriptionType?: string
+  userID?: string
 } | null {
   let parsed: unknown
   try {
@@ -20,16 +22,25 @@ function parseCredentials(raw: string): {
     return null
   }
 
-  const data = (parsed as { claudeAiOauth?: unknown }).claudeAiOauth ?? parsed
-  const creds = data as {
-    accessToken?: unknown
-    refreshToken?: unknown
-    expiresAt?: unknown
-    subscriptionType?: unknown
-    mcpOAuth?: unknown
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null
   }
 
-  if ((parsed as { mcpOAuth?: unknown }).mcpOAuth && !creds.accessToken) {
+  const root = parsed as Record<string, unknown>
+  const data =
+    typeof root.claudeAiOauth === "object" &&
+    root.claudeAiOauth !== null &&
+    !Array.isArray(root.claudeAiOauth)
+      ? (root.claudeAiOauth as Record<string, unknown>)
+      : root
+  const creds = data
+
+  if (
+    typeof root.mcpOAuth === "object" &&
+    root.mcpOAuth !== null &&
+    !Array.isArray(root.mcpOAuth) &&
+    typeof creds.accessToken !== "string"
+  ) {
     return null
   }
 
@@ -45,10 +56,22 @@ function parseCredentials(raw: string): {
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
+    accountUuid:
+      typeof creds.accountUuid === "string"
+        ? creds.accountUuid
+        : typeof root.accountUuid === "string"
+          ? root.accountUuid
+          : undefined,
     subscriptionType:
       typeof creds.subscriptionType === "string"
         ? creds.subscriptionType
         : undefined,
+    userID:
+      typeof creds.userID === "string"
+        ? creds.userID
+        : typeof root.userID === "string"
+          ? root.userID
+          : undefined,
   }
 }
 
@@ -132,6 +155,36 @@ describe("parseCredentials", () => {
     const result = parseCredentials(raw)
     assert.ok(result)
     assert.equal(result.subscriptionType, undefined)
+  })
+
+  it("parses accountUuid and userID from the credential payload", () => {
+    const raw = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "at",
+        refreshToken: "rt",
+        expiresAt: 1700000000000,
+        accountUuid: "acct-123",
+        userID: "device-456",
+      },
+    })
+    const result = parseCredentials(raw)
+    assert.ok(result)
+    assert.equal(result.accountUuid, "acct-123")
+    assert.equal(result.userID, "device-456")
+  })
+
+  it("falls back to root-level accountUuid and userID when nested values are absent", () => {
+    const raw = JSON.stringify({
+      accessToken: "at",
+      refreshToken: "rt",
+      expiresAt: 1700000000000,
+      accountUuid: "acct-root",
+      userID: "device-root",
+    })
+    const result = parseCredentials(raw)
+    assert.ok(result)
+    assert.equal(result.accountUuid, "acct-root")
+    assert.equal(result.userID, "device-root")
   })
 
   it("returns null for MCP-only entries", () => {
@@ -388,7 +441,9 @@ describe("credentials file fallback", () => {
       accessToken: "file-at",
       refreshToken: "file-rt",
       expiresAt: 1700000000000,
+      accountUuid: undefined,
       subscriptionType: undefined,
+      userID: undefined,
     })
     rmSync(tmpDir, { recursive: true, force: true })
   })
@@ -417,5 +472,74 @@ describe("credentials file fallback", () => {
     )
     assert.equal(readCredentialsFile(credPath), null)
     rmSync(tmpDir, { recursive: true, force: true })
+  })
+})
+
+describe("Claude state identity", () => {
+  it("reads official userID and accountUuid from ~/.claude/.claude.json", () => {
+    const tempHome = mkdtempSync(join(tmpdir(), "claude-state-home-"))
+    const originalHome = process.env.HOME
+
+    try {
+      process.env.HOME = tempHome
+      const claudeDir = join(tempHome, ".claude")
+      mkdirSync(claudeDir, { recursive: true })
+      writeFileSync(
+        join(claudeDir, ".claude.json"),
+        JSON.stringify({
+          userID: "device-primary",
+          oauthAccount: { accountUuid: "acct-primary" },
+        }),
+      )
+
+      assert.deepEqual(readClaudeStateIdentity(), {
+        accountUuid: "acct-primary",
+        userID: "device-primary",
+      })
+    } finally {
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
+
+  it("falls back to the latest ~/.claude/backups/.claude.json.backup.* file", () => {
+    const tempHome = mkdtempSync(join(tmpdir(), "claude-state-backup-home-"))
+    const originalHome = process.env.HOME
+
+    try {
+      process.env.HOME = tempHome
+      const backupDir = join(tempHome, ".claude", "backups")
+      mkdirSync(backupDir, { recursive: true })
+      writeFileSync(
+        join(backupDir, ".claude.json.backup.1700000000000"),
+        JSON.stringify({
+          userID: "device-old",
+          oauthAccount: { accountUuid: "acct-old" },
+        }),
+      )
+      writeFileSync(
+        join(backupDir, ".claude.json.backup.1700000000001"),
+        JSON.stringify({
+          userID: "device-new",
+          oauthAccount: { accountUuid: "acct-new" },
+        }),
+      )
+
+      assert.deepEqual(readClaudeStateIdentity(), {
+        accountUuid: "acct-new",
+        userID: "device-new",
+      })
+    } finally {
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
   })
 })
