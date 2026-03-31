@@ -147,20 +147,17 @@ If a long context error still occurs (e.g. from a beta flag added via `ANTHROPIC
 
 ## Environment variable overrides
 
-All configurable parameters can be overridden via environment variables. If Anthropic changes something before we publish an update, set an env var and keep working:
+Request-shaping behavior that affects Claude Code wire compatibility is intentionally pinned. Environment variables still cover beta flags, long-context opt-in, and debug logging, but the plugin no longer allows runtime overrides for the Claude Code version or user-agent.
 
 | Variable                      | Description                                                                | Default                                                                                                 |
 | ----------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `ANTHROPIC_CLI_VERSION`       | Claude CLI version for user-agent and billing headers                      | `2.1.80`                                                                                                |
-| `ANTHROPIC_USER_AGENT`        | Full User-Agent string (overrides CLI version)                             | `claude-cli/{version} (external, cli)`                                                                  |
-| `ANTHROPIC_BETA_FLAGS`        | Comma-separated beta feature flags                                         | `claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05` |
+| `ANTHROPIC_BETA_FLAGS`        | Comma-separated beta feature flags                                         | `claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20` |
 | `ANTHROPIC_ENABLE_1M_CONTEXT` | Enable 1M token context window for 4.6+ models (requires Max subscription) | `false`                                                                                                 |
 | `CLAUDE_AUTH_DEBUG`           | Enable diagnostic logging (`1` for default path, or a custom file path)    | disabled                                                                                                |
 
 Example:
 
 ```bash
-export ANTHROPIC_CLI_VERSION=2.2.0
 export ANTHROPIC_ENABLE_1M_CONTEXT=true  # requires Claude Max
 ```
 
@@ -171,8 +168,13 @@ export ANTHROPIC_ENABLE_1M_CONTEXT=true  # requires Claude Max
 - Translates tool names between OpenCode and Anthropic API formats (adds/strips `mcp_` prefix)
 - Buffers SSE response streams at event boundaries for reliable tool name translation
 - Injects Claude Code identity into system prompts via `experimental.chat.system.transform`
+- Injects protocol-aligned billing metadata into the Anthropic request `system` field and sets `metadata.user_id` when a single Claude account can be mapped safely
 - Sets required API headers (beta flags, billing, user-agent) with model-aware selection
+- Reverse-engineering notes in `protocl.md` now document the recovered official `W6H()` builder, where `metadata.user_id` is a JSON-encoded core bundle containing `{device_id, account_uuid, session_id}` (with parseable extra metadata merged when present) rather than a plain scalar id
+- Reverse-engineering notes in `protocl.md` also document recovered Claude Code telemetry builders (`Zw4`, `vw4`), showing that telemetry and request metadata share the same underlying device/account/session context
+- The helper-level Claude Code 2.1.88 attribution builder still models the visible JS placeholder `cch=00000`, while the actual outgoing request body now fills `cch` with the recovered native 2.1.88 algorithm: seeded XXH64 over the final serialized body while the slot still contains `cch=00000`, then the low 20 bits rendered as 5 lowercase hex chars
 - On macOS, enumerates all `Claude Code-credentials*` Keychain entries and labels them by subscription tier
+- Pins Claude Code request-facing version strings to `2.1.88` so future local CLI updates do not silently change marker hashing, billing header generation, or final `cch` computation
 - Provides an account switcher via `opencode auth login` when multiple accounts are found; persists selection to `~/.local/share/opencode/claude-account-source.txt`
 - Syncs credentials to `auth.json` on startup and every 5 minutes as a fallback
 - On Windows, writes to both `%USERPROFILE%\.local\share\opencode\auth.json` and `%LOCALAPPDATA%\opencode\auth.json`
