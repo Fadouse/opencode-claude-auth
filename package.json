@@ -23,6 +23,9 @@
   "main": "opencode-claude-auth.js",
   "module": "opencode-claude-auth.js",
   "types": "dist/index.d.ts",
+  "oc-plugin": [
+    "server"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

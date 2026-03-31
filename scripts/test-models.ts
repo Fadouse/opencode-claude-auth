@@ -24,7 +24,7 @@ const c = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
 }
 
-const API_URL = "https://api.anthropic.com/v1/messages"
+const API_URL = "https://api.anthropic.com/v1/messages?beta=true"
 const SYSTEM_IDENTITY_PREFIX =
   "You are Claude Code, Anthropic's official CLI for Claude."
 

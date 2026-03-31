@@ -1,6 +1,11 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { config } from "./model-config.ts"
-import { readAllClaudeAccounts, type ClaudeAccount } from "./keychain.ts"
+import { randomUUID } from "node:crypto"
+import { config, EFFORT_BETA, supportsEffort } from "./model-config.ts"
+import {
+  readAllClaudeAccounts,
+  readClaudeStateIdentity,
+  type ClaudeAccount,
+} from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
 import {
   addExcludedBeta,
@@ -10,7 +15,12 @@ import {
   isLongContextError,
   LONG_CONTEXT_BETAS,
 } from "./betas.ts"
-import { transformBody, transformResponseStream } from "./transforms.ts"
+import {
+  transformBody,
+  transformResponseStream,
+  type TransformContext,
+} from "./transforms.ts"
+import { getWorkload } from "./workload.ts"
 import {
   getCachedCredentials,
   syncAuthJson,
@@ -45,16 +55,113 @@ export {
 
 const SYSTEM_IDENTITY_PREFIX =
   "You are Claude Code, Anthropic's official CLI for Claude."
+const OFFICIAL_MESSAGES_URL = "https://api.anthropic.com/v1/messages?beta=true"
+const ANTHROPIC_VERSION = "2023-06-01"
+const REQUEST_TIMEOUT_SECONDS = "600"
+const STAINLESS_LANGUAGE = "js"
+const STAINLESS_OS_NAMES: Record<NodeJS.Platform, string> = {
+  aix: "AIX",
+  android: "Android",
+  darwin: "MacOS",
+  freebsd: "FreeBSD",
+  haiku: "Haiku",
+  linux: "Linux",
+  openbsd: "OpenBSD",
+  sunos: "SunOS",
+  win32: "Windows",
+  cygwin: "Windows",
+  netbsd: "NetBSD",
+}
+const STAINLESS_PACKAGE_VERSION = "0.74.0"
 
 function getCliVersion(): string {
-  return process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion
+  return config.ccVersion
 }
 
 function getUserAgent(): string {
-  return (
-    process.env.ANTHROPIC_USER_AGENT ??
-    `claude-cli/${getCliVersion()} (external, cli)`
-  )
+  const userType = process.env.USER_TYPE ?? "external"
+  const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? "cli"
+  const workload = getWorkload()
+  const workloadSuffix = workload ? `, workload/${workload}` : ""
+
+  return `claude-cli/${getCliVersion()} (${userType}, ${entrypoint}${workloadSuffix})`
+}
+
+function getStainlessOs(): string {
+  return STAINLESS_OS_NAMES[process.platform] ?? process.platform
+}
+
+function buildClientRequestId(): string {
+  return randomUUID()
+}
+
+function filterModelCapabilityBetas(
+  modelId: string,
+  betas: string[],
+): string[] {
+  if (supportsEffort(modelId)) {
+    return betas
+  }
+
+  return betas.filter((beta) => beta !== EFFORT_BETA)
+}
+
+function normalizeAnthropicMessagesInput(
+  input: RequestInfo | URL,
+): RequestInfo | URL {
+  let url: URL
+
+  try {
+    if (input instanceof Request) {
+      url = new URL(input.url)
+    } else if (input instanceof URL) {
+      url = new URL(input.toString())
+    } else {
+      url = new URL(input)
+    }
+  } catch {
+    return input
+  }
+
+  if (
+    url.origin !== "https://api.anthropic.com" ||
+    url.pathname !== "/v1/messages"
+  ) {
+    return input
+  }
+
+  const normalizedUrl = OFFICIAL_MESSAGES_URL
+
+  if (input instanceof Request) {
+    return new Request(normalizedUrl, input)
+  }
+
+  if (input instanceof URL) {
+    return new URL(normalizedUrl)
+  }
+
+  return normalizedUrl
+}
+
+function buildTransformContext(
+  credentials: ClaudeCredentials,
+  sessionId: string,
+): TransformContext {
+  const stateIdentity = readClaudeStateIdentity()
+  const deviceId = stateIdentity?.userID ?? credentials.userID
+
+  if (!deviceId) {
+    throw new Error(
+      "Claude Code official device_id is unavailable. Run `claude` once so ~/.claude/.claude.json can be initialized.",
+    )
+  }
+
+  return {
+    accountUuid: stateIdentity?.accountUuid ?? credentials.accountUuid,
+    cliVersion: getCliVersion(),
+    deviceId,
+    sessionId,
+  }
 }
 
 type FetchFn = typeof fetch
@@ -85,6 +192,7 @@ export function buildRequestHeaders(
   accessToken: string,
   modelId = "unknown",
   excludedBetas?: Set<string>,
+  requestContext?: { clientRequestId?: string; sessionId?: string },
 ): Headers {
   const headers = new Headers()
 
@@ -123,26 +231,47 @@ export function buildRequestHeaders(
         .filter(Boolean),
     ]),
   ]
+  const capabilityFilteredBetas = filterModelCapabilityBetas(
+    modelId,
+    mergedBetas,
+  )
 
   headers.set("authorization", `Bearer ${accessToken}`)
-  headers.set("anthropic-beta", mergedBetas.join(","))
+  headers.set("accept", "application/json")
+  headers.set("anthropic-beta", capabilityFilteredBetas.join(","))
+  headers.set("anthropic-dangerous-direct-browser-access", "true")
+  headers.set("anthropic-version", ANTHROPIC_VERSION)
+  headers.set("content-type", "application/json")
   headers.set("x-app", "cli")
+  headers.set(
+    "x-claude-code-session-id",
+    requestContext?.sessionId ?? randomUUID(),
+  )
+  headers.set(
+    "x-client-request-id",
+    requestContext?.clientRequestId ?? buildClientRequestId(),
+  )
+  headers.set("x-stainless-arch", process.arch)
+  headers.set("x-stainless-lang", STAINLESS_LANGUAGE)
+  headers.set("x-stainless-os", getStainlessOs())
+  headers.set("x-stainless-package-version", STAINLESS_PACKAGE_VERSION)
+  headers.set("x-stainless-retry-count", "0")
+  headers.set("x-stainless-runtime", "node")
+  headers.set("x-stainless-runtime-version", process.version)
+  headers.set("x-stainless-timeout", REQUEST_TIMEOUT_SECONDS)
   headers.set("user-agent", getUserAgent())
-  headers.set("x-anthropic-billing-header", getBillingHeader(modelId))
   headers.delete("x-api-key")
 
   return headers
-}
-
-export function getBillingHeader(modelId: string): string {
-  const entrypoint = "cli"
-  return `cc_version=${getCliVersion()}.${modelId}; cc_entrypoint=${entrypoint}; cch=00000;`
 }
 
 const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
 
 const plugin: Plugin = async () => {
   initLogger()
+  process.env.CLAUDE_CODE_ENTRYPOINT ??= "cli"
+  process.env.USER_TYPE ??= "external"
+  const sessionId = randomUUID()
 
   let accounts: ClaudeAccount[] = []
   try {
@@ -242,6 +371,7 @@ const plugin: Plugin = async () => {
         return {
           apiKey: "",
           async fetch(input: RequestInfo | URL, init?: RequestInit) {
+            const normalizedInput = normalizeAnthropicMessagesInput(input)
             const latest = getCachedCredentials()
             if (!latest) {
               log("fetch_no_credentials", { modelId: "unknown" })
@@ -269,16 +399,22 @@ const plugin: Plugin = async () => {
               expiresAt: latest.expiresAt,
             })
 
+            const clientRequestId = buildClientRequestId()
+
             // Get excluded betas for this model (from previous failed requests)
             const excluded = getExcludedBetas(modelId)
             const headers = buildRequestHeaders(
-              input,
+              normalizedInput,
               requestInit,
               latest.accessToken,
               modelId,
               excluded,
+              { clientRequestId, sessionId },
             )
-            const body = transformBody(requestInit.body)
+            const body = transformBody(
+              requestInit.body,
+              buildTransformContext(latest, sessionId),
+            )
 
             const headerKeys: string[] = []
             headers.forEach((_, key) => headerKeys.push(key))
@@ -287,7 +423,7 @@ const plugin: Plugin = async () => {
               .filter(Boolean)
             log("fetch_headers_built", { headerKeys, betas, modelId })
 
-            let response = await fetchWithRetry(input, {
+            let response = await fetchWithRetry(normalizedInput, {
               ...requestInit,
               body,
               headers,
@@ -331,14 +467,15 @@ const plugin: Plugin = async () => {
               // Rebuild headers without the excluded beta and retry
               const newExcluded = getExcludedBetas(modelId)
               const newHeaders = buildRequestHeaders(
-                input,
+                normalizedInput,
                 requestInit,
                 latest.accessToken,
                 modelId,
                 newExcluded,
+                { clientRequestId, sessionId },
               )
 
-              response = await fetchWithRetry(input, {
+              response = await fetchWithRetry(normalizedInput, {
                 ...requestInit,
                 body,
                 headers: newHeaders,
