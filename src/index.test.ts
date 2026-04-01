@@ -872,7 +872,21 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         }
         temperature: number
         tools: unknown[]
-        system: Array<{ text: string; type: string }>
+        system: Array<{
+          text: string
+          type: string
+          cache_control?: { type: string }
+        }>
+        messages: Array<{
+          role: string
+          content: Array<{
+            type: string
+            text?: string
+            tool_use_id?: string
+            cache_control?: { type: string; scope?: string; ttl?: string }
+            edits?: Array<{ old_text: string; new_text: string }>
+          }>
+        }>
         stream: boolean
       }
       assert.deepEqual(
@@ -897,11 +911,15 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       assert.deepEqual(parsed.system[1], {
         type: "text",
         text: "Existing system",
+        cache_control: { type: "ephemeral" },
       })
       assert.deepEqual(parsed.tools, [])
       assert.equal(parsed.temperature, 1)
       assert.equal(parsed.output_config.effort, undefined)
       assert.equal(parsed.output_config.format.type, "json_schema")
+      assert.deepEqual(parsed.messages[0]?.content[0]?.cache_control, {
+        type: "ephemeral",
+      })
 
       const metadata = JSON.parse(parsed.metadata.user_id) as {
         account_uuid: string
@@ -993,9 +1011,19 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
 
       assert.ok(capturedInit)
       const parsed = JSON.parse(String(capturedInit.body)) as {
-        system: string
+        system: Array<{
+          text: string
+          type: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
       }
-      assert.equal(parsed.system, "Existing system")
+      assert.deepEqual(parsed.system, [
+        {
+          type: "text",
+          text: "Existing system",
+          cache_control: { type: "ephemeral" },
+        },
+      ])
     } finally {
       globalThis.setInterval = originalSetInterval
       globalThis.fetch = originalFetch

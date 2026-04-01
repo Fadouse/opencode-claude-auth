@@ -53,7 +53,7 @@ export {
   type ClaudeCredentials,
 } from "./credentials.ts"
 
-const SYSTEM_IDENTITY_PREFIX =
+const DEFAULT_SYSTEM_IDENTITY_PREFIX =
   "You are Claude Code, Anthropic's official CLI for Claude."
 const OFFICIAL_MESSAGES_URL = "https://api.anthropic.com/v1/messages?beta=true"
 const ANTHROPIC_VERSION = "2023-06-01"
@@ -337,10 +337,10 @@ const plugin: Plugin = async () => {
       }
 
       const hasIdentityPrefix = output.system.some((entry) =>
-        entry.includes(SYSTEM_IDENTITY_PREFIX),
+        entry.includes(DEFAULT_SYSTEM_IDENTITY_PREFIX),
       )
       if (!hasIdentityPrefix) {
-        output.system.unshift(SYSTEM_IDENTITY_PREFIX)
+        output.system.unshift(DEFAULT_SYSTEM_IDENTITY_PREFIX)
       }
     },
     auth: {

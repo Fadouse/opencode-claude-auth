@@ -162,10 +162,18 @@ describe("transforms", () => {
       assert.equal(typeof output, "string")
 
       const parsed = JSON.parse(output as string) as {
-        system: Array<{ text: string; type: string }>
+        system: Array<{
+          text: string
+          type: string
+          cache_control?: { type: string }
+        }>
       }
       assert.deepEqual(parsed.system, [
-        { type: "text", text: "Existing system" },
+        {
+          type: "text",
+          text: "Existing system",
+          cache_control: { type: "ephemeral" },
+        },
       ])
     } finally {
       if (typeof originalAttribution === "string") {
@@ -200,7 +208,7 @@ describe("transforms", () => {
 
       const parsed = JSON.parse(output as string) as {
         metadata: { trace_id: string; user_id: string }
-        system: Array<{ text: string; type: string }>
+        system: Array<{ text: string; type: string; cache_control?: { type: string } }>
       }
 
       assert.match(
@@ -210,13 +218,14 @@ describe("transforms", () => {
       assert.deepEqual(parsed.system[1], {
         type: "text",
         text: "Existing system",
+        cache_control: { type: "ephemeral" },
       })
       assert.equal(parsed.metadata.trace_id, "trace-1")
       assert.deepEqual(JSON.parse(parsed.metadata.user_id), {
+        workspace: "repo",
         device_id: "device-456",
         account_uuid: "acct-123",
         session_id: "session-789",
-        workspace: "repo",
       })
     } finally {
       if (typeof originalEntrypoint === "string") {
@@ -259,6 +268,80 @@ describe("transforms", () => {
       "output_config",
       "stream",
     ])
+  })
+
+  it("transformBody places extra body params after context_management and before output_config", () => {
+    const input = JSON.stringify({
+      model: "claude-opus-4-6",
+      messages: [{ role: "user", content: "Hello from request body" }],
+      system: "Existing system",
+      metadata: { trace_id: "trace-1" },
+      max_tokens: 64000,
+      context_management: { mode: "auto" },
+      custom_extra_body_param: { enabled: true },
+      output_config: { format: { type: "json_schema", schema: { type: "object" } } },
+      speed: "fast",
+      stream: true,
+    })
+
+    const output = transformBody(input, {
+      accountUuid: "acct-123",
+      cliVersion: "2.1.88",
+      deviceId: "device-456",
+      sessionId: "session-789",
+    })
+
+    assert.equal(typeof output, "string")
+    const parsed = JSON.parse(output as string) as Record<string, unknown>
+
+    assert.deepEqual(Object.keys(parsed), [
+      "model",
+      "messages",
+      "system",
+      "metadata",
+      "max_tokens",
+      "context_management",
+      "custom_extra_body_param",
+      "output_config",
+      "speed",
+      "stream",
+    ])
+  })
+
+  it("transformBody preserves core metadata identity fields over extra metadata", () => {
+    process.env.CLAUDE_CODE_EXTRA_METADATA = JSON.stringify({
+      device_id: "override-device",
+      account_uuid: "override-account",
+      session_id: "override-session",
+      workspace: "repo",
+    })
+
+    try {
+      const input = JSON.stringify({
+        messages: [{ role: "user", content: "Hello from request body" }],
+      })
+
+      const output = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      assert.equal(typeof output, "string")
+      const parsed = JSON.parse(output as string) as {
+        metadata: { user_id: string }
+      }
+
+      assert.deepEqual(JSON.parse(parsed.metadata.user_id), {
+        workspace: "repo",
+        device_id: "device-456",
+        account_uuid: "acct-123",
+        session_id: "session-789",
+      })
+    } finally {
+      delete process.env.CLAUDE_CODE_EXTRA_METADATA
+    }
   })
 
   it("computeSeededCchHash matches the recovered seeded XXH64 runtime value", () => {
@@ -328,6 +411,416 @@ describe("transforms", () => {
       "output_config",
       "stream",
     ])
+  })
+
+  it("transformBody adds official-style cache markers to the last system and message blocks", () => {
+    const input = JSON.stringify({
+      system: [{ type: "text", text: "Existing system" }],
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Earlier content" },
+            {
+              type: "tool_result",
+              tool_use_id: "tool-1",
+              content: [{ type: "text", text: "tool result" }],
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Last assistant block" }],
+        },
+      ],
+    })
+
+    const output = transformBody(input, {
+      accountUuid: "acct-123",
+      cliVersion: "2.1.88",
+      deviceId: "device-456",
+      sessionId: "session-789",
+    })
+
+    assert.equal(typeof output, "string")
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{
+        type: string
+        text: string
+        cache_control?: { type: string; scope?: string; ttl?: string }
+      }>
+      messages: Array<{
+        role: string
+        content: Array<{
+          type: string
+          text?: string
+          tool_use_id?: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }>
+    }
+
+    assert.deepEqual(parsed.system[1], {
+      type: "text",
+      text: "Existing system",
+      cache_control: { type: "ephemeral" },
+    })
+    assert.deepEqual(parsed.messages[1]?.content[0]?.cache_control, {
+      type: "ephemeral",
+    })
+  })
+
+  it("transformBody uses metadata cache edit block and skip-global system cache options", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+
+    try {
+      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
+
+      const input = JSON.stringify({
+        metadata: {
+          cache_edit_block: {
+            type: "cache_edits",
+            edits: [{ old_text: "foo", new_text: "bar" }],
+          },
+          query_source: "repl_main_thread",
+          skip_global_cache_for_system_prompt: true,
+        },
+        system: [
+          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { type: "text", text: "Existing system" },
+        ],
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "r1" }] },
+              { type: "text", text: "tail-1" },
+            ],
+          },
+        ],
+      })
+
+      const output = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      assert.equal(typeof output, "string")
+      const parsed = JSON.parse(output as string) as {
+        system: Array<{
+          type: string
+          text: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+        messages: Array<{
+          role: string
+          content: Array<{
+            type: string
+            text?: string
+            tool_use_id?: string
+            edits?: Array<{ old_text: string; new_text: string }>
+          }>
+        }>
+      }
+
+      assert.deepEqual(parsed.system[1], {
+        type: "text",
+        text: "You are Claude Code, Anthropic's official CLI for Claude.",
+        cache_control: { type: "ephemeral" },
+      })
+      assert.deepEqual(parsed.system[2], {
+        type: "text",
+        text: "Existing system",
+        cache_control: { type: "ephemeral" },
+      })
+      assert.equal(parsed.messages[0]?.content[1]?.type, "cache_edits")
+      assert.deepEqual(parsed.messages[0]?.content[1]?.edits, [
+        { old_text: "foo", new_text: "bar" },
+      ])
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+    }
+  })
+
+  it("transformBody only uses global system cache scope for first-party provider", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+    const originalDisableBetas = process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+
+    try {
+      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
+      delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+
+      const firstPartyInput = JSON.stringify({
+        system: [
+          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { type: "text", text: "Static preface" },
+          { type: "text", text: "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__" },
+          { type: "text", text: "Dynamic tail" },
+        ],
+        messages: [{ role: "user", content: "Hello from request body" }],
+      })
+
+      const firstPartyOutput = transformBody(firstPartyInput, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      const firstPartyParsed = JSON.parse(firstPartyOutput as string) as {
+        system: Array<{
+          type: string
+          text: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }
+
+      assert.deepEqual(firstPartyParsed.system[2], {
+        type: "text",
+        text: "Static preface",
+        cache_control: { type: "ephemeral", scope: "global" },
+      })
+      assert.deepEqual(firstPartyParsed.system[3], {
+        type: "text",
+        text: "Dynamic tail",
+      })
+
+      process.env.ANTHROPIC_API_PROVIDER = "bedrock"
+
+      const thirdPartyOutput = transformBody(firstPartyInput, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      const thirdPartyParsed = JSON.parse(thirdPartyOutput as string) as {
+        system: Array<{
+          type: string
+          text: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }
+
+      assert.deepEqual(thirdPartyParsed.system[1], {
+        type: "text",
+        text: "You are Claude Code, Anthropic's official CLI for Claude.",
+        cache_control: { type: "ephemeral" },
+      })
+      assert.deepEqual(thirdPartyParsed.system[2], {
+        type: "text",
+        text: "Static preface\n\nDynamic tail",
+        cache_control: { type: "ephemeral" },
+      })
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+
+      if (typeof originalDisableBetas === "string") {
+        process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS = originalDisableBetas
+      } else {
+        delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
+      }
+    }
+  })
+
+  it("transformBody inserts pinned and new cache edits after tool results", () => {
+    const originalCacheEdit = process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+    process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK = JSON.stringify({
+      type: "cache_edits",
+      edits: [{ old_text: "foo", new_text: "bar" }],
+    })
+    process.env.ANTHROPIC_API_PROVIDER = "firstParty"
+
+    try {
+      const input = JSON.stringify({
+        metadata: {
+          query_source: "repl_main_thread",
+          pinned_cache_edits: [
+            {
+              userMessageIndex: 0,
+              block: {
+                type: "cache_edits",
+                edits: [{ old_text: "old", new_text: "new" }],
+              },
+            },
+          ],
+        },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "r1" }] },
+              { type: "text", text: "tail-1" },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "tool-2", content: [{ type: "text", text: "r2" }] },
+              { type: "text", text: "tail-2" },
+            ],
+          },
+        ],
+      })
+
+      const output = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      assert.equal(typeof output, "string")
+      const parsed = JSON.parse(output as string) as {
+        messages: Array<{
+          content: Array<{
+            type: string
+            text?: string
+            tool_use_id?: string
+            edits?: Array<{ old_text: string; new_text: string }>
+            cache_control?: { type: string; scope?: string; ttl?: string }
+          }>
+        }>
+      }
+
+      assert.equal(parsed.messages[0]?.content[1]?.type, "cache_edits")
+      assert.deepEqual(parsed.messages[0]?.content[1]?.edits, [
+        { old_text: "old", new_text: "new" },
+      ])
+      assert.equal(parsed.messages[0]?.content[2]?.type, "text")
+
+      assert.equal(parsed.messages[1]?.content[1]?.type, "cache_edits")
+      assert.deepEqual(parsed.messages[1]?.content[1]?.edits, [
+        { old_text: "foo", new_text: "bar" },
+      ])
+      assert.equal(parsed.messages[1]?.content[2]?.type, "text")
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+      if (typeof originalCacheEdit === "string") {
+        process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK = originalCacheEdit
+      } else {
+        delete process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK
+      }
+    }
+  })
+
+  it("transformBody does not insert cache edits outside official cached-MC conditions", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+
+    try {
+      process.env.ANTHROPIC_API_PROVIDER = "bedrock"
+
+      const input = JSON.stringify({
+        metadata: {
+          query_source: "repl_main_thread",
+          cache_edit_block: {
+            type: "cache_edits",
+            edits: [{ old_text: "foo", new_text: "bar" }],
+          },
+          pinned_cache_edits: [
+            {
+              userMessageIndex: 0,
+              block: {
+                type: "cache_edits",
+                edits: [{ old_text: "old", new_text: "new" }],
+              },
+            },
+          ],
+        },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "r1" }] },
+              { type: "text", text: "tail-1" },
+            ],
+          },
+        ],
+      })
+
+      const output = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      assert.equal(typeof output, "string")
+      const parsed = JSON.parse(output as string) as {
+        messages: Array<{
+          content: Array<{
+            type: string
+            text?: string
+            tool_use_id?: string
+            edits?: Array<{ old_text: string; new_text: string }>
+          }>
+        }>
+      }
+
+      assert.equal(parsed.messages[0]?.content.length, 2)
+      assert.equal(parsed.messages[0]?.content[0]?.type, "tool_result")
+      assert.equal(parsed.messages[0]?.content[1]?.type, "text")
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+    }
+  })
+
+  it("transformBody does not cache-mark assistant thinking blocks", () => {
+    const input = JSON.stringify({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "prefix" },
+            { type: "thinking", thinking: "secret" },
+          ],
+        },
+      ],
+    })
+
+    const output = transformBody(input, {
+      accountUuid: "acct-123",
+      cliVersion: "2.1.88",
+      deviceId: "device-456",
+      sessionId: "session-789",
+    })
+
+    assert.equal(typeof output, "string")
+    const parsed = JSON.parse(output as string) as {
+      messages: Array<{
+        content: Array<{
+          type: string
+          text?: string
+          thinking?: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }>
+    }
+
+    assert.equal(parsed.messages[0]?.content[1]?.type, "thinking")
+    assert.equal(parsed.messages[0]?.content[1]?.cache_control, undefined)
+    assert.deepEqual(parsed.messages[0]?.content[0]?.cache_control, {
+      type: "ephemeral",
+    })
   })
 
   it("stripToolPrefix removes mcp_ from response payload names", () => {

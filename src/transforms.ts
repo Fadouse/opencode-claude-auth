@@ -5,6 +5,12 @@ import { getWorkload } from "./workload.ts"
 const TOOL_PREFIX = "mcp_"
 const PROMPT_MARKER_SEED_PREFIX = "59cf53e54c78"
 const CCH_SLOT = "cch=00000"
+const SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
+const CLI_SYSTEM_PROMPT_PREFIXES = new Set([
+  "You are Claude Code, Anthropic's official CLI for Claude.",
+  "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+])
 const CCH_SEED = 0x6e52736ac806831en
 const XXH64_MASK = 0xffffffffffffffffn
 const XXH64_PRIME_1 = 0x9e3779b185ebca87n
@@ -17,13 +23,19 @@ const REQUEST_KEY_ORDER = [
   "messages",
   "system",
   "tools",
+  "tool_choice",
+  "betas",
   "metadata",
   "max_tokens",
   "thinking",
   "temperature",
+  "context_management",
   "output_config",
+  "speed",
   "stream",
 ] as const
+const EXTRA_BODY_PARAMS_INSERT_AFTER = "context_management"
+const EXTRA_BODY_PARAMS_INSERT_BEFORE = ["output_config", "speed", "stream"] as const
 
 export interface TransformContext {
   accountUuid?: string
@@ -33,6 +45,29 @@ export interface TransformContext {
 }
 
 type JsonObject = Record<string, unknown>
+
+type CacheControl = {
+  scope?: "global"
+  ttl?: "1h" | "5m"
+  type: "ephemeral"
+}
+
+type CacheEditBlock = JsonObject & {
+  type: "cache_edits"
+}
+
+type PromptCachingOptions = {
+  newCacheEditBlock: CacheEditBlock | null
+  pinnedCacheEdits: Array<{ block: CacheEditBlock; userMessageIndex: number }>
+  querySource?: string
+  skipCacheWrite: boolean
+  skipGlobalCacheForSystemPrompt: boolean
+}
+
+type SystemPromptBlock = {
+  cacheScope: "global" | "org" | null
+  text: string
+}
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -70,6 +105,515 @@ function normalizeSystemBlocks(system: unknown): Array<string | JsonObject> {
 
     return isJsonObject(entry) ? [entry] : []
   })
+}
+
+function getSystemBlockText(block: string | JsonObject): string | null {
+  if (typeof block === "string") {
+    return block
+  }
+
+  return typeof block.text === "string" ? block.text : null
+}
+
+function cloneJsonValue<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function isCacheEditBlock(block: unknown): block is CacheEditBlock {
+  return isJsonObject(block) && block.type === "cache_edits"
+}
+
+function shouldUseOneHourCacheTtl(querySource?: string): boolean {
+  if (process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK) {
+    return true
+  }
+
+  if (!querySource) {
+    return false
+  }
+
+  const allowlist = process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST
+  if (!allowlist) {
+    return false
+  }
+
+  return allowlist
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .some((entry) => {
+      if (entry.endsWith("*")) {
+        return querySource.startsWith(entry.slice(0, -1))
+      }
+
+      return querySource === entry
+    })
+}
+
+function getCacheControl(options?: {
+  querySource?: string
+  scope?: "global" | "org" | null
+}): CacheControl {
+  const cacheControl: CacheControl = { type: "ephemeral" }
+
+  if (shouldUseOneHourCacheTtl(options?.querySource)) {
+    cacheControl.ttl = "1h"
+  }
+
+  if (options?.scope === "global") {
+    cacheControl.scope = "global"
+  }
+
+  return cacheControl
+}
+
+function addCacheControlToBlock(
+  block: unknown,
+  options?: { querySource?: string; scope?: "global" | "org" | null },
+): unknown {
+  if (!isJsonObject(block)) {
+    return block
+  }
+
+  return {
+    ...block,
+    cache_control: getCacheControl(options),
+  }
+}
+
+function isAssistantCacheIneligible(block: unknown): boolean {
+  if (!isJsonObject(block)) {
+    return false
+  }
+
+  if (block.type === "thinking" || block.type === "redacted_thinking") {
+    return true
+  }
+
+  if (block.type === "text" && block.is_connector === true) {
+    return true
+  }
+
+  return false
+}
+
+function isAttributionSystemText(text: string): boolean {
+  return text.startsWith("x-anthropic-billing-header")
+}
+
+function isCliSystemPrefixText(text: string): boolean {
+  return CLI_SYSTEM_PROMPT_PREFIXES.has(text)
+}
+
+function shouldUseGlobalCacheScope(): boolean {
+  return (
+    process.env.ANTHROPIC_API_PROVIDER === "firstParty" &&
+    !isEnvDefinedFalsy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)
+  )
+}
+
+function isMainThreadQuerySource(querySource?: string): boolean {
+  return (
+    querySource === "repl_main_thread" ||
+    querySource?.startsWith("repl_main_thread:outputStyle:") === true
+  )
+}
+
+function shouldUseCachedMicrocompact(
+  options: PromptCachingOptions,
+): boolean {
+  // Official source: ../src/services/api/claude.ts:addCacheBreakpoints(...)
+  // gates cache-editing API-layer behavior behind
+  // `useCachedMC = cachedMCEnabled && getAPIProvider() === 'firstParty' && options.querySource === 'repl_main_thread'`.
+  // Official source: ../src/services/compact/microCompact.ts further explains
+  // cached MC is main-thread-only via isMainThreadSource(querySource).
+  // The local plugin only models the request-visible/API-layer subset here,
+  // so we require the source-backed provider + main-thread conditions before
+  // emitting cache_edits-derived request mutations.
+  return (
+    process.env.ANTHROPIC_API_PROVIDER === "firstParty" &&
+    isMainThreadQuerySource(options.querySource)
+  )
+}
+
+function splitSystemPromptPrefix(
+  system: unknown,
+  options?: { skipGlobalCacheForSystemPrompt?: boolean },
+): SystemPromptBlock[] {
+  const normalized = normalizeSystemBlocks(system)
+  const textBlocks = normalized
+    .map((block) => ({ raw: block, text: getSystemBlockText(block) }))
+    .filter((block): block is { raw: string | JsonObject; text: string } =>
+      typeof block.text === "string",
+    )
+
+  if (textBlocks.length === 0) {
+    return []
+  }
+
+  const attribution = textBlocks.find((block) => isAttributionSystemText(block.text))
+  const cliPrefix = textBlocks.find((block) => isCliSystemPrefixText(block.text))
+  const remainingTexts = textBlocks
+    .filter(
+      (block) =>
+        !isAttributionSystemText(block.text) && !isCliSystemPrefixText(block.text),
+    )
+    .map((block) => block.text)
+
+  const shouldGlobalScope = shouldUseGlobalCacheScope()
+  const boundaryIndex = remainingTexts.indexOf(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+
+  if (shouldGlobalScope && options?.skipGlobalCacheForSystemPrompt) {
+    const remainingWithoutBoundary = remainingTexts.filter(
+      (text) => text !== SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    )
+
+    const blocks: Array<SystemPromptBlock | null> = [
+      attribution
+        ? {
+            text: attribution.text,
+            cacheScope: null,
+          }
+        : null,
+      cliPrefix
+        ? {
+            text: cliPrefix.text,
+            cacheScope: "org",
+          }
+        : null,
+      remainingWithoutBoundary.length > 0
+        ? {
+            text: remainingWithoutBoundary.join("\n\n"),
+            cacheScope: "org",
+          }
+        : null,
+    ]
+    return blocks.flatMap((block) => (block && block.text ? [block] : []))
+  }
+
+  if (shouldGlobalScope && boundaryIndex !== -1) {
+    const beforeBoundary = remainingTexts.slice(0, boundaryIndex)
+    const afterBoundary = remainingTexts
+      .slice(boundaryIndex + 1)
+      .filter((text) => text !== SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+
+    const blocks: Array<SystemPromptBlock | null> = [
+      attribution
+        ? {
+            text: attribution.text,
+            cacheScope: null,
+          }
+        : null,
+      cliPrefix
+        ? {
+            text: cliPrefix.text,
+            cacheScope: null,
+          }
+        : null,
+      beforeBoundary.length > 0
+        ? {
+            text: beforeBoundary.join("\n\n"),
+            cacheScope: "global",
+          }
+        : null,
+      afterBoundary.length > 0
+        ? {
+            text: afterBoundary.join("\n\n"),
+            cacheScope: null,
+          }
+        : null,
+    ]
+    return blocks.flatMap((block) => (block && block.text ? [block] : []))
+  }
+
+  const blocks: Array<SystemPromptBlock | null> = [
+    attribution
+      ? {
+          text: attribution.text,
+          cacheScope: null,
+        }
+      : null,
+    cliPrefix
+      ? {
+          text: cliPrefix.text,
+          cacheScope: "org",
+        }
+      : null,
+    remainingTexts.length > 0
+      ? {
+          text: remainingTexts.filter((text) => text !== SYSTEM_PROMPT_DYNAMIC_BOUNDARY).join("\n\n"),
+          cacheScope: "org",
+        }
+      : null,
+  ]
+  return blocks.flatMap((block) => (block && block.text ? [block] : []))
+}
+
+function getMessageRole(message: JsonObject): string | undefined {
+  return typeof message.role === "string" ? message.role : undefined
+}
+
+function addCacheControlToMessageContent(
+  content: unknown,
+  role: string | undefined,
+  options?: { querySource?: string; scope?: "global" | "org" | null },
+): unknown {
+  if (typeof content === "string") {
+    return [
+      {
+        type: "text",
+        text: content,
+        cache_control: getCacheControl(options),
+      },
+    ]
+  }
+
+  if (!Array.isArray(content) || content.length === 0) {
+    return content
+  }
+
+  const clonedContent = content.map((block) => cloneJsonValue(block))
+  const markerIndex = [...clonedContent].reverse().findIndex((block) => {
+    if (role !== "assistant") {
+      return true
+    }
+
+    return !isAssistantCacheIneligible(block)
+  })
+
+  if (markerIndex === -1) {
+    return clonedContent
+  }
+
+  const actualIndex = clonedContent.length - 1 - markerIndex
+  clonedContent[actualIndex] = addCacheControlToBlock(clonedContent[actualIndex], options)
+  return clonedContent
+}
+
+function applyPromptCachingToSystem(
+  system: unknown,
+  options?: { querySource?: string; skipGlobalCacheForSystemPrompt?: boolean },
+): Array<string | JsonObject> {
+  return splitSystemPromptPrefix(system, options).map((block) => {
+    const systemBlock = {
+      type: "text",
+      text: block.text,
+    }
+
+    return block.cacheScope === null
+      ? systemBlock
+      : (addCacheControlToBlock(systemBlock, {
+          querySource: options?.querySource,
+          scope: block.cacheScope,
+        }) as JsonObject)
+  })
+}
+
+function insertBlockAfterToolResults(
+  content: Array<Record<string, unknown>>,
+  block: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  let insertIndex = content.length - 1
+
+  for (let index = content.length - 1; index >= 0; index -= 1) {
+    const candidate = content[index]
+    if (isJsonObject(candidate) && candidate.type === "tool_result") {
+      insertIndex = index + 1
+      break
+    }
+  }
+
+  const nextContent = [...content]
+  nextContent.splice(insertIndex, 0, cloneJsonValue(block))
+
+  if (insertIndex >= content.length) {
+    nextContent.push({ text: ".", type: "text" })
+  }
+
+  return nextContent
+}
+
+function applyPinnedCacheEdits(
+  messages: Array<Record<string, unknown>>,
+  pinnedCacheEdits: PromptCachingOptions["pinnedCacheEdits"],
+  seenDeleteRefs: Set<string>,
+): Array<Record<string, unknown>> {
+  if (pinnedCacheEdits.length === 0) {
+    return messages
+  }
+
+  return messages.map((message, index) => {
+    if (!isJsonObject(message) || !Array.isArray(message.content)) {
+      return message
+    }
+
+    const matchingBlocks = pinnedCacheEdits
+      .filter((entry) => entry.userMessageIndex === index)
+      .map((entry) => deduplicateCacheEditBlock(entry.block, seenDeleteRefs))
+      .filter((entry): entry is CacheEditBlock => entry !== null)
+
+    if (matchingBlocks.length === 0) {
+      return message
+    }
+
+    let content = message.content.map((block) => cloneJsonValue(block))
+    for (const block of matchingBlocks) {
+      content = insertBlockAfterToolResults(content, block)
+    }
+
+    return {
+      ...message,
+      content,
+    }
+  })
+}
+
+function deduplicateCacheEditBlock(
+  block: CacheEditBlock,
+  seenDeleteRefs: Set<string>,
+): CacheEditBlock | null {
+  const edits = Array.isArray(block.edits) ? block.edits : []
+  const deduplicated = edits.flatMap((edit) => {
+    if (!isJsonObject(edit)) {
+      return []
+    }
+
+    const cacheReference =
+      typeof edit.cache_reference === "string" ? edit.cache_reference : undefined
+
+    if (!cacheReference) {
+      return [edit]
+    }
+
+    if (seenDeleteRefs.has(cacheReference)) {
+      return []
+    }
+
+    seenDeleteRefs.add(cacheReference)
+    return [edit]
+  })
+
+  if (deduplicated.length === 0) {
+    return null
+  }
+
+  return {
+    ...cloneJsonValue(block),
+    edits: deduplicated,
+  }
+}
+
+function getLastUserMessageIndex(messages: Array<JsonObject>): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (getMessageRole(message) === "user") {
+      return index
+    }
+  }
+
+  return -1
+}
+
+function applyPromptCachingToMessages(
+  messages: Array<JsonObject>,
+  options: PromptCachingOptions,
+): Array<JsonObject> {
+  const transformed = messages.map((message) => ({ ...message }))
+
+  if (transformed.length === 0) {
+    return transformed
+  }
+
+  const markerIndex = options.skipCacheWrite
+    ? Math.max(transformed.length - 2, 0)
+    : transformed.length - 1
+  const markerMessage = transformed[markerIndex]
+
+  if (markerMessage) {
+    markerMessage.content = addCacheControlToMessageContent(
+      markerMessage.content,
+      getMessageRole(markerMessage),
+      {
+        querySource: options.querySource,
+        scope: "org",
+      },
+    )
+  }
+
+  if (!shouldUseCachedMicrocompact(options)) {
+    return transformed
+  }
+
+  const seenDeleteRefs = new Set<string>()
+  const withPinnedEdits = applyPinnedCacheEdits(
+    transformed,
+    options.pinnedCacheEdits,
+    seenDeleteRefs,
+  )
+
+  const lastUserMessageIndex = getLastUserMessageIndex(withPinnedEdits)
+  const newCacheEdit = options.newCacheEditBlock
+
+  if (lastUserMessageIndex < 0 || !newCacheEdit) {
+    return withPinnedEdits
+  }
+
+  const deduplicatedNewCacheEdit = deduplicateCacheEditBlock(
+    newCacheEdit,
+    seenDeleteRefs,
+  )
+
+  if (!deduplicatedNewCacheEdit) {
+    return withPinnedEdits
+  }
+
+  return withPinnedEdits.map((message, index) => {
+    if (index !== lastUserMessageIndex || !Array.isArray(message.content)) {
+      return message
+    }
+
+    return {
+      ...message,
+      content: insertBlockAfterToolResults(message.content, deduplicatedNewCacheEdit),
+    }
+  })
+}
+
+function parsePinnedCacheEdits(metadata: unknown): PromptCachingOptions["pinnedCacheEdits"] {
+  if (!isJsonObject(metadata) || !Array.isArray(metadata.pinned_cache_edits)) {
+    return []
+  }
+
+  return metadata.pinned_cache_edits.flatMap((entry) => {
+    if (!isJsonObject(entry) || !isCacheEditBlock(entry.block) || typeof entry.userMessageIndex !== "number") {
+      return []
+    }
+
+    return [
+      {
+        block: cloneJsonValue(entry.block),
+        userMessageIndex: entry.userMessageIndex,
+      },
+    ]
+  })
+}
+
+function getNewCacheEditBlock(metadata: unknown): CacheEditBlock | null {
+  if (isJsonObject(metadata) && isCacheEditBlock(metadata.cache_edit_block)) {
+    return cloneJsonValue(metadata.cache_edit_block)
+  }
+
+  const raw = process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK
+  if (!raw) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return isCacheEditBlock(parsed) ? cloneJsonValue(parsed) : null
+  } catch {
+    return null
+  }
 }
 
 function getFirstUserMessageText(messages: unknown): string {
@@ -139,16 +683,32 @@ function sanitizeOutputConfig(
 function orderRequestKeys(parsed: JsonObject): JsonObject {
   const ordered: JsonObject = {}
   const seen = new Set<string>()
+  const extraBodyParamEntries: Array<[string, unknown]> = []
 
   for (const key of REQUEST_KEY_ORDER) {
     if (key in parsed) {
+      if (key === EXTRA_BODY_PARAMS_INSERT_BEFORE[0]) {
+        for (const [extraKey, extraValue] of extraBodyParamEntries) {
+          ordered[extraKey] = extraValue
+          seen.add(extraKey)
+        }
+      }
+
       ordered[key] = parsed[key]
       seen.add(key)
+    }
+
+    if (key === EXTRA_BODY_PARAMS_INSERT_AFTER) {
+      for (const [entryKey, entryValue] of Object.entries(parsed)) {
+        if (!seen.has(entryKey) && !REQUEST_KEY_ORDER.includes(entryKey as (typeof REQUEST_KEY_ORDER)[number])) {
+          extraBodyParamEntries.push([entryKey, entryValue])
+        }
+      }
     }
   }
 
   for (const [key, value] of Object.entries(parsed)) {
-    if (!seen.has(key)) {
+    if (!seen.has(key) && !extraBodyParamEntries.some(([extraKey]) => extraKey === key)) {
       ordered[key] = value
     }
   }
@@ -399,21 +959,48 @@ export function transformBody(
         firstUserMessageText,
         context.cliVersion,
       )
+      const metadata = isJsonObject(request.metadata) ? request.metadata : {}
+      const promptCachingOptions: PromptCachingOptions = {
+        newCacheEditBlock: getNewCacheEditBlock(metadata),
+        pinnedCacheEdits: parsePinnedCacheEdits(metadata),
+        querySource:
+          typeof metadata.query_source === "string" ? metadata.query_source : undefined,
+        skipCacheWrite: metadata.skip_cache_write === true,
+        skipGlobalCacheForSystemPrompt:
+          metadata.skip_global_cache_for_system_prompt === true,
+      }
+
       if (billingText) {
         request.system = [
           { type: "text", text: billingText },
-          ...normalizeSystemBlocks(request.system),
+          ...applyPromptCachingToSystem(request.system, {
+            querySource: promptCachingOptions.querySource,
+            skipGlobalCacheForSystemPrompt:
+              promptCachingOptions.skipGlobalCacheForSystemPrompt,
+          }),
         ]
+      } else {
+        request.system = applyPromptCachingToSystem(request.system, {
+          querySource: promptCachingOptions.querySource,
+          skipGlobalCacheForSystemPrompt:
+            promptCachingOptions.skipGlobalCacheForSystemPrompt,
+        })
       }
 
-      const metadata = isJsonObject(request.metadata) ? request.metadata : {}
+      if (Array.isArray(request.messages)) {
+        request.messages = applyPromptCachingToMessages(
+          request.messages,
+          promptCachingOptions,
+        ) as typeof request.messages
+      }
+
       request.metadata = {
         ...metadata,
         user_id: JSON.stringify({
+          ...getExtraMetadata(),
           device_id: context.deviceId,
           account_uuid: context.accountUuid ?? "",
           session_id: context.sessionId,
-          ...getExtraMetadata(),
         }),
       }
     }
