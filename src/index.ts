@@ -17,6 +17,7 @@ import {
 } from "./betas.ts"
 import {
   markToolsSentToAPIState,
+  recordLastApiCompletionTimestamp,
   transformBody,
   transformResponseStream,
   type TransformContext,
@@ -498,6 +499,7 @@ const plugin: Plugin = async () => {
             //   calls it after the successful API response flow.
             if (response.ok) {
               markToolsSentToAPIState()
+              recordLastApiCompletionTimestamp()
             }
 
             return transformResponseStream(response)

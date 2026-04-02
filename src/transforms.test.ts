@@ -13,6 +13,9 @@ import {
   isAttributionHeaderEnabled,
   markToolsSentToAPIState,
   pinCacheEdits,
+  recordLastApiCompletionTimestamp,
+  resetPromptCache1hLatchState,
+  resetThinkingClearLatchState,
   resetMicrocompactState,
   stripToolPrefix,
   transformBody,
@@ -443,6 +446,263 @@ describe("transforms", () => {
     }
   })
 
+  it("transformBody enables 1h cache TTL only for bedrock when the env gate is set", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+    const originalBedrockGate = process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK
+
+    process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK = "1"
+
+    try {
+      const input = JSON.stringify({
+        messages: [{ role: "user", content: "Hello from request body" }],
+        system: [
+          "You are Claude Code, Anthropic's official CLI for Claude.",
+          "Static preface",
+          "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__",
+          "Dynamic tail",
+        ],
+      })
+
+      process.env.ANTHROPIC_API_PROVIDER = "bedrock"
+      const bedrockOutput = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+      const bedrockParsed = JSON.parse(bedrockOutput as string) as {
+        system: Array<{
+          text: string
+          type: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }
+
+      assert.equal(
+        bedrockParsed.system[0]?.text?.startsWith("x-anthropic-billing-header:"),
+        true,
+      )
+      assert.equal(bedrockParsed.system[0]?.cache_control, undefined)
+      assert.deepEqual(bedrockParsed.system[1], {
+        type: "text",
+        text: "You are Claude Code, Anthropic's official CLI for Claude.",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      })
+      assert.deepEqual(bedrockParsed.system[2], {
+        type: "text",
+        text: "Static preface\n\nDynamic tail",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      })
+
+      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
+      const firstPartyOutput = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+      const firstPartyParsed = JSON.parse(firstPartyOutput as string) as {
+        system: Array<{
+          text: string
+          type: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }
+
+      assert.equal(
+        firstPartyParsed.system[0]?.text?.startsWith("x-anthropic-billing-header:"),
+        true,
+      )
+      assert.equal(firstPartyParsed.system[0]?.cache_control, undefined)
+      assert.equal(firstPartyParsed.system[1]?.text, "You are Claude Code, Anthropic's official CLI for Claude.")
+      assert.equal(firstPartyParsed.system[1]?.cache_control, undefined)
+      assert.deepEqual(firstPartyParsed.system[2], {
+        type: "text",
+        text: "Static preface",
+        cache_control: { type: "ephemeral", scope: "global" },
+      })
+      assert.deepEqual(firstPartyParsed.system[3], {
+        type: "text",
+        text: "Dynamic tail",
+      })
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+
+      if (typeof originalBedrockGate === "string") {
+        process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK = originalBedrockGate
+      } else {
+        delete process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK
+      }
+    }
+  })
+
+  it("transformBody latches prompt-cache 1h allowlist for session stability", () => {
+    const originalAllowlist = process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST
+
+    resetPromptCache1hLatchState()
+    process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST = "repl_main_thread*"
+
+    try {
+      const input = JSON.stringify({
+        metadata: { query_source: "repl_main_thread:outputStyle:default" },
+        messages: [{ role: "user", content: "Hello from request body" }],
+        system: [
+          "You are Claude Code, Anthropic's official CLI for Claude.",
+          "Static preface",
+        ],
+      })
+
+      const firstOutput = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+      const firstParsed = JSON.parse(firstOutput as string) as {
+        system: Array<{
+          text: string
+          type: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }
+
+      assert.deepEqual(firstParsed.system[1], {
+        type: "text",
+        text: "You are Claude Code, Anthropic's official CLI for Claude.",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      })
+      assert.deepEqual(firstParsed.system[2], {
+        type: "text",
+        text: "Static preface",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      })
+
+      process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST = "different_query_source"
+
+      const secondOutput = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-790",
+      })
+      const secondParsed = JSON.parse(secondOutput as string) as {
+        system: Array<{
+          text: string
+          type: string
+          cache_control?: { type: string; scope?: string; ttl?: string }
+        }>
+      }
+
+      assert.deepEqual(secondParsed.system[1], {
+        type: "text",
+        text: "You are Claude Code, Anthropic's official CLI for Claude.",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      })
+      assert.deepEqual(secondParsed.system[2], {
+        type: "text",
+        text: "Static preface",
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      })
+    } finally {
+      resetPromptCache1hLatchState()
+      if (typeof originalAllowlist === "string") {
+        process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST = originalAllowlist
+      } else {
+        delete process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST
+      }
+    }
+  })
+
+  it("transformBody enables clear_thinking_20251015 after 1h idle for agentic query sources", () => {
+    resetThinkingClearLatchState()
+
+    try {
+      recordLastApiCompletionTimestamp(Date.now() - 61 * 60 * 1000)
+
+      const input = JSON.stringify({
+        metadata: { query_source: "repl_main_thread" },
+        model: "claude-opus-4-6",
+        messages: [{ role: "user", content: "Hello from request body" }],
+        thinking: { budget_tokens: 1024, type: "enabled" },
+      })
+
+      const output = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      assert.equal(typeof output, "string")
+      const parsed = JSON.parse(output as string) as {
+        context_management: {
+          edits: Array<{
+            type: string
+            keep: "all" | { type: string; value: number }
+          }>
+        }
+      }
+
+      assert.deepEqual(parsed.context_management, {
+        edits: [
+          {
+            type: "clear_thinking_20251015",
+            keep: { type: "thinking_turns", value: 1 },
+          },
+        ],
+      })
+    } finally {
+      resetThinkingClearLatchState()
+    }
+  })
+
+  it("transformBody keeps all thinking when not in an agentic query source", () => {
+    resetThinkingClearLatchState()
+
+    try {
+      recordLastApiCompletionTimestamp(Date.now() - 61 * 60 * 1000)
+
+      const input = JSON.stringify({
+        metadata: { query_source: "side_question" },
+        model: "claude-opus-4-6",
+        messages: [{ role: "user", content: "Hello from request body" }],
+        thinking: { budget_tokens: 1024, type: "enabled" },
+      })
+
+      const output = transformBody(input, {
+        accountUuid: "acct-123",
+        cliVersion: "2.1.88",
+        deviceId: "device-456",
+        sessionId: "session-789",
+      })
+
+      assert.equal(typeof output, "string")
+      const parsed = JSON.parse(output as string) as {
+        context_management: {
+          edits: Array<{
+            type: string
+            keep: "all" | { type: string; value: number }
+          }>
+        }
+      }
+
+      assert.deepEqual(parsed.context_management, {
+        edits: [
+          {
+            type: "clear_thinking_20251015",
+            keep: "all",
+          },
+        ],
+      })
+    } finally {
+      resetThinkingClearLatchState()
+    }
+  })
+
   it("transformBody preserves core metadata identity fields over extra metadata", () => {
     process.env.CLAUDE_CODE_EXTRA_METADATA = JSON.stringify({
       device_id: "override-device",
@@ -549,7 +809,15 @@ describe("transforms", () => {
   })
 
   it("transformBody adds official-style cache markers to the last system and message blocks", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+
+    try {
+      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
+
     const input = JSON.stringify({
+      metadata: {
+        query_source: "repl_main_thread",
+      },
       system: [{ type: "text", text: "Existing system" }],
       messages: [
         {
@@ -564,8 +832,8 @@ describe("transforms", () => {
           ],
         },
         {
-          role: "assistant",
-          content: [{ type: "text", text: "Last assistant block" }],
+          role: "user",
+          content: [{ type: "text", text: "Last user marker block" }],
         },
       ],
     })
@@ -590,6 +858,7 @@ describe("transforms", () => {
           type: string
           text?: string
           tool_use_id?: string
+          cache_reference?: string
           cache_control?: { type: string; scope?: string; ttl?: string }
         }>
       }>
@@ -600,9 +869,20 @@ describe("transforms", () => {
       text: "Existing system",
       cache_control: { type: "ephemeral" },
     })
+    assert.equal(
+      parsed.messages[0]?.content[1]?.cache_reference,
+      parsed.messages[0]?.content[1]?.tool_use_id,
+    )
     assert.deepEqual(parsed.messages[1]?.content[0]?.cache_control, {
       type: "ephemeral",
     })
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+    }
   })
 
   it("transformBody uses metadata cache edit block and skip-global system cache options", () => {

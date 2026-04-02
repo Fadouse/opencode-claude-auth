@@ -37,6 +37,7 @@ const REQUEST_KEY_ORDER = [
 ] as const
 const EXTRA_BODY_PARAMS_INSERT_AFTER = "context_management"
 const EXTRA_BODY_PARAMS_INSERT_BEFORE = ["output_config", "speed", "stream"] as const
+const CACHE_TTL_1HOUR_MS = 60 * 60 * 1000
 
 export interface TransformContext {
   accountUuid?: string
@@ -80,6 +81,10 @@ const cachedMicrocompactState: CachedMicrocompactState = {
   pendingCacheEdits: null,
   pinnedCacheEdits: [],
 }
+
+let promptCache1hAllowlistLatched: string[] | null = null
+let thinkingClearLatched: boolean | null = null
+let lastApiCompletionTimestamp: number | null = null
 
 type TransformRequest = JsonObject & {
   betas?: unknown
@@ -158,8 +163,50 @@ function isCacheEditBlock(block: unknown): block is CacheEditBlock {
   return isJsonObject(block) && block.type === "cache_edits"
 }
 
+function getLatchedPromptCache1hAllowlist(): string[] {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:415-423`
+  //   the allowlist is loaded once and cached in bootstrap state for session stability.
+  // - `.inspect-claude-code-2.1.88/src/bootstrap/state.ts:1692-1698`
+  //   provides get/set accessors for the latched allowlist.
+  if (promptCache1hAllowlistLatched !== null) {
+    return promptCache1hAllowlistLatched
+  }
+
+  const allowlist = process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST
+  promptCache1hAllowlistLatched = allowlist
+    ? allowlist
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+    : []
+  return promptCache1hAllowlistLatched
+}
+
+export function resetPromptCache1hLatchState(): void {
+  promptCache1hAllowlistLatched = null
+}
+
+export function recordLastApiCompletionTimestamp(
+  timestamp = Date.now(),
+): void {
+  lastApiCompletionTimestamp = timestamp
+}
+
+export function resetThinkingClearLatchState(): void {
+  thinkingClearLatched = null
+  lastApiCompletionTimestamp = null
+}
+
 function shouldUseOneHourCacheTtl(querySource?: string): boolean {
-  if (process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK) {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:393-401`
+  //   Bedrock gets 1h TTL only when the provider is `bedrock` and
+  //   `ENABLE_PROMPT_CACHING_1H_BEDROCK` is truthy.
+  if (
+    process.env.ANTHROPIC_API_PROVIDER === "bedrock" &&
+    process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK
+  ) {
     return true
   }
 
@@ -167,22 +214,78 @@ function shouldUseOneHourCacheTtl(querySource?: string): boolean {
     return false
   }
 
-  const allowlist = process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST
-  if (!allowlist) {
-    return false
+  return getLatchedPromptCache1hAllowlist().some((entry) => {
+    if (entry.endsWith("*")) {
+      return querySource.startsWith(entry.slice(0, -1))
+    }
+
+    return querySource === entry
+  })
+}
+
+function isAgenticQuerySource(querySource?: string): boolean {
+  return (
+    querySource?.startsWith("repl_main_thread") === true ||
+    querySource?.startsWith("agent:") === true ||
+    querySource === "sdk" ||
+    querySource === "hook_agent" ||
+    querySource === "verification_agent"
+  )
+}
+
+function shouldClearThinkingForQuery(querySource?: string): boolean {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts`
+  //   latches `thinkingClearLatched` only for `isAgenticQuery`, and only when
+  //   `Date.now() - getLastApiCompletionTimestamp() > CACHE_TTL_1HOUR_MS`.
+  // - `.inspect-claude-code-2.1.88/src/bootstrap/state.ts:1732-1748`
+  //   stores `thinkingClearLatched` in session state and clears it with the
+  //   beta-header latch reset path.
+  let latched = thinkingClearLatched === true
+  if (!latched && isAgenticQuerySource(querySource)) {
+    if (
+      lastApiCompletionTimestamp !== null &&
+      Date.now() - lastApiCompletionTimestamp > CACHE_TTL_1HOUR_MS
+    ) {
+      thinkingClearLatched = true
+      latched = true
+    }
   }
 
-  return allowlist
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .some((entry) => {
-      if (entry.endsWith("*")) {
-        return querySource.startsWith(entry.slice(0, -1))
-      }
+  return latched
+}
 
-      return querySource === entry
-    })
+function buildContextManagement(request: TransformRequest, options: PromptCachingOptions) {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/compact/apiMicrocompact.ts`
+  //   `getAPIContextManagement(options?)` emits
+  //   `{ edits: [{ type: 'clear_thinking_20251015', keep: ... }] }`
+  //   when `hasThinking && !isRedactThinkingActive`.
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts`
+  //   passes `clearAllThinking: thinkingClearLatched` into that builder.
+  const hasThinking = typeof request.thinking !== "undefined"
+  const redactThinkingActive =
+    Array.isArray(request.betas) &&
+    request.betas.includes("redact-thinking-2026-02-12")
+
+  if (!hasThinking || redactThinkingActive) {
+    return request.context_management
+  }
+
+  if (typeof request.context_management !== "undefined") {
+    return request.context_management
+  }
+
+  return {
+    edits: [
+      {
+        type: "clear_thinking_20251015",
+        keep: shouldClearThinkingForQuery(options.querySource)
+          ? { type: "thinking_turns", value: 1 }
+          : "all",
+      },
+    ],
+  }
 }
 
 function getCacheControl(options?: {
@@ -661,8 +764,12 @@ function applyPromptCachingToMessages(
   const lastUserMessageIndex = getLastUserMessageIndex(withPinnedEdits)
   const newCacheEdit = options.newCacheEditBlock
 
-  if (lastUserMessageIndex < 0 || !newCacheEdit) {
-    return withPinnedEdits
+  if (lastUserMessageIndex < 0) {
+    return addCacheReferenceToToolResults(withPinnedEdits)
+  }
+
+  if (!newCacheEdit) {
+    return addCacheReferenceToToolResults(withPinnedEdits)
   }
 
   const deduplicatedNewCacheEdit = deduplicateCacheEditBlock(
@@ -1326,6 +1433,10 @@ export function transformBody(
       )
       request.messages = buildRequestMessages(
         request.messages,
+        promptCachingOptions,
+      )
+      request.context_management = buildContextManagement(
+        request,
         promptCachingOptions,
       )
       request.metadata = buildRequestMetadata(request.metadata, context)
