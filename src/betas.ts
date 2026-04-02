@@ -114,8 +114,51 @@ export function getModelBetas(
 
   // Filter out excluded betas (from previous failed requests due to long context errors)
   if (excluded && excluded.size > 0) {
-    return betas.filter((beta) => !excluded.has(beta))
+    const filtered = betas.filter((beta) => !excluded.has(beta))
+    return shouldSplitBedrockExtraBodyBetas()
+      ? filtered.filter((beta) => !BEDROCK_EXTRA_BODY_PARAMS_BETAS.has(beta))
+      : filtered
   }
 
-  return betas
+  return shouldSplitBedrockExtraBodyBetas()
+    ? betas.filter((beta) => !BEDROCK_EXTRA_BODY_PARAMS_BETAS.has(beta))
+    : betas
+}
+
+const BEDROCK_EXTRA_BODY_PARAMS_BETAS = new Set<string>([
+  "fine-grained-tool-streaming-2025-05-14",
+])
+
+function shouldSplitBedrockExtraBodyBetas(): boolean {
+  return process.env.ANTHROPIC_API_PROVIDER === "bedrock"
+}
+
+export function getBedrockExtraBodyParamsBetas(modelId: string): string[] {
+  const betas = [...getRequiredBetas()]
+
+  if (
+    process.env.ANTHROPIC_ENABLE_1M_CONTEXT === "true" &&
+    supports1mContext(modelId)
+  ) {
+    betas.push(config.longContextBetas[0])
+  }
+
+  const override = getModelOverride(modelId)
+  if (override) {
+    if (override.exclude) {
+      for (const ex of override.exclude) {
+        const idx = betas.indexOf(ex)
+        if (idx !== -1) betas.splice(idx, 1)
+      }
+    }
+    if (override.add) {
+      for (const add of override.add) {
+        if (!betas.includes(add)) betas.push(add)
+      }
+    }
+  }
+
+  return betas.filter((beta) =>
+    BEDROCK_EXTRA_BODY_PARAMS_BETAS.has(beta),
+  )
 }

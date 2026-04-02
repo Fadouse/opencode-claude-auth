@@ -16,6 +16,7 @@ import {
   LONG_CONTEXT_BETAS,
 } from "./betas.ts"
 import {
+  markToolsSentToAPIState,
   transformBody,
   transformResponseStream,
   type TransformContext,
@@ -93,6 +94,10 @@ function getStainlessOs(): string {
 
 function buildClientRequestId(): string {
   return randomUUID()
+}
+
+function shouldSendClientRequestId(): boolean {
+  return process.env.ANTHROPIC_API_PROVIDER === "firstParty"
 }
 
 function filterModelCapabilityBetas(
@@ -247,10 +252,14 @@ export function buildRequestHeaders(
     "x-claude-code-session-id",
     requestContext?.sessionId ?? randomUUID(),
   )
-  headers.set(
-    "x-client-request-id",
-    requestContext?.clientRequestId ?? buildClientRequestId(),
-  )
+  if (shouldSendClientRequestId()) {
+    headers.set(
+      "x-client-request-id",
+      requestContext?.clientRequestId ?? buildClientRequestId(),
+    )
+  } else {
+    headers.delete("x-client-request-id")
+  }
   headers.set("x-stainless-arch", process.arch)
   headers.set("x-stainless-lang", STAINLESS_LANGUAGE)
   headers.set("x-stainless-os", getStainlessOs())
@@ -480,6 +489,15 @@ const plugin: Plugin = async () => {
                 body,
                 headers: newHeaders,
               })
+            }
+
+            // Official source citation:
+            // - `.inspect-claude-code-2.1.88/src/services/compact/microCompact.ts:124-127`
+            //   defines `markToolsSentToAPIState()`.
+            // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:2833-2836`
+            //   calls it after the successful API response flow.
+            if (response.ok) {
+              markToolsSentToAPIState()
             }
 
             return transformResponseStream(response)

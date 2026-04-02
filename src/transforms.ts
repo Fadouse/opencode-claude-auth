@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { supportsEffort } from "./model-config.ts"
 import { getWorkload } from "./workload.ts"
+import { getBedrockExtraBodyParamsBetas } from "./betas.ts"
 
 const TOOL_PREFIX = "mcp_"
 const PROMPT_MARKER_SEED_PREFIX = "59cf53e54c78"
@@ -62,6 +63,40 @@ type PromptCachingOptions = {
   querySource?: string
   skipCacheWrite: boolean
   skipGlobalCacheForSystemPrompt: boolean
+}
+
+type RequestTool = JsonObject & {
+  defer_loading?: boolean
+  isMcp?: boolean
+  name?: string
+}
+
+type CachedMicrocompactState = {
+  pendingCacheEdits: CacheEditBlock | null
+  pinnedCacheEdits: Array<{ block: CacheEditBlock; userMessageIndex: number }>
+}
+
+const cachedMicrocompactState: CachedMicrocompactState = {
+  pendingCacheEdits: null,
+  pinnedCacheEdits: [],
+}
+
+type TransformRequest = JsonObject & {
+  betas?: unknown
+  context_management?: unknown
+  max_tokens?: unknown
+  messages?: Array<{
+    content?: string | Array<Record<string, unknown>>
+    role?: string
+  }>
+  metadata?: unknown
+  model?: string
+  output_config?: unknown
+  speed?: unknown
+  system?: unknown
+  thinking?: unknown
+  tool_choice?: unknown
+  tools?: Array<{ name?: string } & Record<string, unknown>>
 }
 
 type SystemPromptBlock = {
@@ -503,6 +538,78 @@ function deduplicateCacheEditBlock(
   }
 }
 
+function addCacheReferenceToToolResults(
+  messages: Array<JsonObject>,
+): Array<JsonObject> {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:3164-3207`
+  //   After cache_edits insertion, official Claude Code adds top-level
+  //   `cache_reference: tool_use_id` to `tool_result` blocks that are strictly
+  //   before the last message containing any `cache_control` marker.
+  let lastCacheControlMessageIndex = -1
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]
+    if (!message || !Array.isArray(message.content)) {
+      continue
+    }
+
+    for (const block of message.content) {
+      if (isJsonObject(block) && "cache_control" in block) {
+        lastCacheControlMessageIndex = index
+      }
+    }
+  }
+
+  if (lastCacheControlMessageIndex < 0) {
+    return messages
+  }
+
+  return messages.map((message, index) => {
+    if (
+      index >= lastCacheControlMessageIndex ||
+      getMessageRole(message) !== "user" ||
+      !Array.isArray(message.content)
+    ) {
+      return message
+    }
+
+    let cloned = false
+    const nextContent = message.content.map((block) => cloneJsonValue(block))
+
+    for (let blockIndex = 0; blockIndex < nextContent.length; blockIndex += 1) {
+      const block = nextContent[blockIndex]
+      if (!isJsonObject(block) || block.type !== "tool_result") {
+        continue
+      }
+
+      const toolUseId =
+        typeof block.tool_use_id === "string" ? block.tool_use_id : undefined
+      if (!toolUseId) {
+        continue
+      }
+
+      if (!cloned) {
+        cloned = true
+      }
+
+      nextContent[blockIndex] = {
+        ...block,
+        cache_reference: toolUseId,
+      }
+    }
+
+    if (!cloned) {
+      return message
+    }
+
+    return {
+      ...message,
+      content: nextContent,
+    }
+  })
+}
+
 function getLastUserMessageIndex(messages: Array<JsonObject>): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
@@ -564,10 +671,10 @@ function applyPromptCachingToMessages(
   )
 
   if (!deduplicatedNewCacheEdit) {
-    return withPinnedEdits
+    return addCacheReferenceToToolResults(withPinnedEdits)
   }
 
-  return withPinnedEdits.map((message, index) => {
+  const withNewEdits = withPinnedEdits.map((message, index) => {
     if (index !== lastUserMessageIndex || !Array.isArray(message.content)) {
       return message
     }
@@ -577,6 +684,8 @@ function applyPromptCachingToMessages(
       content: insertBlockAfterToolResults(message.content, deduplicatedNewCacheEdit),
     }
   })
+
+  return addCacheReferenceToToolResults(withNewEdits)
 }
 
 function parsePinnedCacheEdits(metadata: unknown): PromptCachingOptions["pinnedCacheEdits"] {
@@ -614,6 +723,48 @@ function getNewCacheEditBlock(metadata: unknown): CacheEditBlock | null {
   } catch {
     return null
   }
+}
+
+// Official source citation:
+// - `.inspect-claude-code-2.1.88/src/services/compact/microCompact.ts`
+//   exports module-level lifecycle helpers with these exact responsibilities:
+//   `consumePendingCacheEdits()`, `getPinnedCacheEdits()`, `pinCacheEdits()`,
+//   `markToolsSentToAPIState()`, `resetMicrocompactState()`.
+// - The local plugin mirrors only the request-visible/API-layer subset here.
+export function consumePendingCacheEdits(): CacheEditBlock | null {
+  const edits = cachedMicrocompactState.pendingCacheEdits
+  cachedMicrocompactState.pendingCacheEdits = null
+  return edits ? cloneJsonValue(edits) : null
+}
+
+export function getPinnedCacheEdits(): PromptCachingOptions["pinnedCacheEdits"] {
+  return cachedMicrocompactState.pinnedCacheEdits.map((entry) => ({
+    block: cloneJsonValue(entry.block),
+    userMessageIndex: entry.userMessageIndex,
+  }))
+}
+
+export function pinCacheEdits(
+  userMessageIndex: number,
+  block: CacheEditBlock,
+): void {
+  cachedMicrocompactState.pinnedCacheEdits.push({
+    block: cloneJsonValue(block),
+    userMessageIndex,
+  })
+}
+
+export function markToolsSentToAPIState(): void {
+  cachedMicrocompactState.pendingCacheEdits = null
+}
+
+export function resetMicrocompactState(): void {
+  cachedMicrocompactState.pendingCacheEdits = null
+  cachedMicrocompactState.pinnedCacheEdits = []
+}
+
+function stagePendingCacheEdits(block: CacheEditBlock | null): void {
+  cachedMicrocompactState.pendingCacheEdits = block ? cloneJsonValue(block) : null
 }
 
 function getFirstUserMessageText(messages: unknown): string {
@@ -662,6 +813,120 @@ function getExtraMetadata(): JsonObject {
   }
 }
 
+function getExtraBodyParams(betaHeaders?: string[]): JsonObject {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:272-331`
+  //   `getExtraBodyParams(betaHeaders?)` reads `CLAUDE_CODE_EXTRA_BODY`, accepts
+  //   only JSON objects, shallow-clones the parsed object, and merges
+  //   `betaHeaders` into `anthropic_beta` without duplicates.
+  const raw = process.env.CLAUDE_CODE_EXTRA_BODY
+  let result: JsonObject = {}
+
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (isJsonObject(parsed)) {
+        result = { ...parsed }
+      }
+    } catch {
+      result = {}
+    }
+  }
+
+  if (betaHeaders && betaHeaders.length > 0) {
+    const existingHeaders = Array.isArray(result.anthropic_beta)
+      ? result.anthropic_beta.filter(
+          (header): header is string => typeof header === "string",
+        )
+      : []
+    const newHeaders = betaHeaders.filter(
+      (header) => !existingHeaders.includes(header),
+    )
+
+    result.anthropic_beta =
+      existingHeaders.length > 0 || newHeaders.length > 0
+        ? [...existingHeaders, ...newHeaders]
+        : result.anthropic_beta
+  }
+
+  return result
+}
+
+function getProviderExtraBodyBetas(model: unknown): string[] {
+  // Official source: .inspect-claude-code-2.1.88/src/utils/betas.ts:379-383
+  // defines getBedrockExtraBodyParamsBetas(model) and
+  // .inspect-claude-code-2.1.88/src/services/api/claude.ts:1549-1557,1713,1723
+  // routes Bedrock-only betas into extraBodyParams.anthropic_beta instead of the
+  // normal top-level/body beta path.
+  if (
+    process.env.ANTHROPIC_API_PROVIDER !== "bedrock" ||
+    typeof model !== "string"
+  ) {
+    return []
+  }
+
+  return getBedrockExtraBodyParamsBetas(model)
+}
+
+function buildPromptCachingOptions(metadata: unknown): PromptCachingOptions {
+  const normalizedMetadata = isJsonObject(metadata) ? metadata : {}
+  const metadataPinnedCacheEdits = parsePinnedCacheEdits(normalizedMetadata)
+  const metadataCacheEditBlock = getNewCacheEditBlock(normalizedMetadata)
+
+  if (metadataPinnedCacheEdits.length > 0) {
+    cachedMicrocompactState.pinnedCacheEdits = metadataPinnedCacheEdits.map(
+      (entry) => ({
+        block: cloneJsonValue(entry.block),
+        userMessageIndex: entry.userMessageIndex,
+      }),
+    )
+  }
+
+  if (metadataCacheEditBlock) {
+    stagePendingCacheEdits(metadataCacheEditBlock)
+  }
+
+  return {
+    newCacheEditBlock: consumePendingCacheEdits(),
+    pinnedCacheEdits: getPinnedCacheEdits(),
+    querySource:
+      typeof normalizedMetadata.query_source === "string"
+        ? normalizedMetadata.query_source
+        : undefined,
+    skipCacheWrite: normalizedMetadata.skip_cache_write === true,
+    skipGlobalCacheForSystemPrompt:
+      normalizedMetadata.skip_global_cache_for_system_prompt === true,
+  }
+}
+
+function shouldDeferToolForGlobalCache(tool: RequestTool): boolean {
+  return tool.defer_loading === true
+}
+
+function needsToolBasedCacheMarker(
+  tools: TransformRequest["tools"],
+): boolean {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:1207-1214`
+  //   computes `needsToolBasedCacheMarker = useGlobalCacheFeature && filteredTools.some(t => t.isMcp === true && !willDefer(t))`.
+  // - In the official client, `willDefer(t)` is `useToolSearch && (deferredToolNames.has(t.name) || shouldDeferLspTool(t))`.
+  // - The local plugin does not own Claude Code's tool-search planner or deferred-tool registry,
+  //   so the exact source-backed subset we can observe on request tools is:
+  //   MCP tool + not explicitly marked `defer_loading`.
+  if (!shouldUseGlobalCacheScope() || !Array.isArray(tools)) {
+    return false
+  }
+
+  return tools.some((tool) => {
+    if (!isJsonObject(tool)) {
+      return false
+    }
+
+    const requestTool = tool as RequestTool
+    return requestTool.isMcp === true && !shouldDeferToolForGlobalCache(requestTool)
+  })
+}
+
 function sanitizeOutputConfig(
   outputConfig: unknown,
   modelId: unknown,
@@ -678,6 +943,112 @@ function sanitizeOutputConfig(
   delete sanitized.effort
 
   return Object.keys(sanitized).length > 0 ? sanitized : undefined
+}
+
+function buildRequestSystem(
+  system: unknown,
+  context: TransformContext,
+  options: PromptCachingOptions,
+  messages: unknown,
+  tools: TransformRequest["tools"],
+): Array<string | JsonObject> {
+  const firstUserMessageText = getFirstUserMessageText(messages)
+  const billingText = buildBillingSystemText(firstUserMessageText, context.cliVersion)
+  const skipGlobalCacheForSystemPrompt =
+    options.skipGlobalCacheForSystemPrompt || needsToolBasedCacheMarker(tools)
+
+  if (billingText) {
+    return [
+      { type: "text", text: billingText },
+      ...applyPromptCachingToSystem(system, {
+        querySource: options.querySource,
+        skipGlobalCacheForSystemPrompt,
+      }),
+    ]
+  }
+
+  return applyPromptCachingToSystem(system, {
+    querySource: options.querySource,
+    skipGlobalCacheForSystemPrompt,
+  })
+}
+
+function buildRequestMessages(
+  messages: TransformRequest["messages"],
+  options: PromptCachingOptions,
+): TransformRequest["messages"] {
+  if (!Array.isArray(messages)) {
+    return messages
+  }
+
+  const result = applyPromptCachingToMessages(messages, options) as typeof messages
+
+  if (
+    Array.isArray(result) &&
+    options.newCacheEditBlock
+  ) {
+    const lastUserMessageIndex = getLastUserMessageIndex(result as Array<JsonObject>)
+    if (lastUserMessageIndex >= 0) {
+      pinCacheEdits(lastUserMessageIndex, options.newCacheEditBlock)
+    }
+  }
+
+  return result
+}
+
+function buildRequestMetadata(
+  metadata: unknown,
+  context: TransformContext,
+): JsonObject {
+  const normalizedMetadata = isJsonObject(metadata) ? metadata : {}
+
+  return {
+    ...normalizedMetadata,
+    user_id: JSON.stringify({
+      ...getExtraMetadata(),
+      device_id: context.deviceId,
+      account_uuid: context.accountUuid ?? "",
+      session_id: context.sessionId,
+    }),
+  }
+}
+
+function applyExtraBodyParams(request: TransformRequest): void {
+  // Official source citation:
+  // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:1549-1728`
+  //   `paramsFromContext(...)` builds `extraBodyParams = getExtraBodyParams(...)`
+  //   and spreads `...extraBodyParams` after `context_management` but before
+  //   `output_config` and `speed`. `output_config` is separately built from
+  //   `extraBodyParams.output_config` and later overrides it; `speed` only
+  //   overrides an extra-body `speed` when an explicit computed `speed` exists.
+  const extraBodyParams = getExtraBodyParams(
+    getProviderExtraBodyBetas(request.model),
+  )
+
+  const extraOutputConfig = isJsonObject(extraBodyParams.output_config)
+    ? cloneJsonValue(extraBodyParams.output_config)
+    : undefined
+  const extraSpeed = extraBodyParams.speed
+
+  delete extraBodyParams.output_config
+  delete extraBodyParams.speed
+
+  Object.assign(request, extraBodyParams)
+
+  if (extraOutputConfig) {
+    request.output_config = isJsonObject(request.output_config)
+      ? { ...extraOutputConfig, ...request.output_config }
+      : extraOutputConfig
+  }
+
+  if (typeof request.speed === "undefined" && typeof extraSpeed !== "undefined") {
+    request.speed = cloneJsonValue(extraSpeed)
+  }
+}
+
+function finalizeRequestBody(request: JsonObject): string {
+  const serializedBody = JSON.stringify(orderRequestKeys(request))
+  return fillCchInSerializedBody(serializedBody)
 }
 
 function orderRequestKeys(parsed: JsonObject): JsonObject {
@@ -902,17 +1273,7 @@ export function transformBody(
       return body
     }
 
-    const request = parsed as {
-      metadata?: unknown
-      model?: string
-      output_config?: unknown
-      system?: unknown
-      tools?: Array<{ name?: string } & Record<string, unknown>>
-      messages?: Array<{
-        content?: string | Array<Record<string, unknown>>
-        role?: string
-      }>
-    }
+    const request = parsed as TransformRequest
 
     if (Array.isArray(request.tools)) {
       request.tools = request.tools.map((tool) => ({
@@ -954,59 +1315,25 @@ export function transformBody(
     }
 
     if (context) {
-      const firstUserMessageText = getFirstUserMessageText(request.messages)
-      const billingText = buildBillingSystemText(
-        firstUserMessageText,
-        context.cliVersion,
+      const promptCachingOptions = buildPromptCachingOptions(request.metadata)
+
+      request.system = buildRequestSystem(
+        request.system,
+        context,
+        promptCachingOptions,
+        request.messages,
+        request.tools,
       )
-      const metadata = isJsonObject(request.metadata) ? request.metadata : {}
-      const promptCachingOptions: PromptCachingOptions = {
-        newCacheEditBlock: getNewCacheEditBlock(metadata),
-        pinnedCacheEdits: parsePinnedCacheEdits(metadata),
-        querySource:
-          typeof metadata.query_source === "string" ? metadata.query_source : undefined,
-        skipCacheWrite: metadata.skip_cache_write === true,
-        skipGlobalCacheForSystemPrompt:
-          metadata.skip_global_cache_for_system_prompt === true,
-      }
-
-      if (billingText) {
-        request.system = [
-          { type: "text", text: billingText },
-          ...applyPromptCachingToSystem(request.system, {
-            querySource: promptCachingOptions.querySource,
-            skipGlobalCacheForSystemPrompt:
-              promptCachingOptions.skipGlobalCacheForSystemPrompt,
-          }),
-        ]
-      } else {
-        request.system = applyPromptCachingToSystem(request.system, {
-          querySource: promptCachingOptions.querySource,
-          skipGlobalCacheForSystemPrompt:
-            promptCachingOptions.skipGlobalCacheForSystemPrompt,
-        })
-      }
-
-      if (Array.isArray(request.messages)) {
-        request.messages = applyPromptCachingToMessages(
-          request.messages,
-          promptCachingOptions,
-        ) as typeof request.messages
-      }
-
-      request.metadata = {
-        ...metadata,
-        user_id: JSON.stringify({
-          ...getExtraMetadata(),
-          device_id: context.deviceId,
-          account_uuid: context.accountUuid ?? "",
-          session_id: context.sessionId,
-        }),
-      }
+      request.messages = buildRequestMessages(
+        request.messages,
+        promptCachingOptions,
+      )
+      request.metadata = buildRequestMetadata(request.metadata, context)
     }
 
-    const serializedBody = JSON.stringify(orderRequestKeys(parsed))
-    return fillCchInSerializedBody(serializedBody)
+    applyExtraBodyParams(request)
+
+    return finalizeRequestBody(parsed)
   } catch {
     return body
   }

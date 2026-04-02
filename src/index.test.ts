@@ -316,61 +316,100 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
   })
 
   it("buildRequestHeaders sets auth headers and strips x-api-key", () => {
-    const headers = helpers.buildRequestHeaders(
-      "https://api.anthropic.com/v1/messages?beta=true",
-      {
-        headers: {
-          "anthropic-beta": "custom-beta",
-          "x-api-key": "old-key",
-          "x-custom": "keep-me",
-        },
-      },
-      "access-token",
-      "claude-sonnet-4-6",
-      undefined,
-      {
-        clientRequestId: "request-123",
-        sessionId: "session-123",
-      },
-    )
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+    process.env.ANTHROPIC_API_PROVIDER = "firstParty"
 
-    assert.equal(headers.get("authorization"), "Bearer access-token")
-    assert.equal(headers.get("accept"), "application/json")
-    assert.equal(headers.get("x-api-key"), null)
-    assert.equal(headers.get("x-custom"), "keep-me")
-    assert.ok(headers.get("anthropic-beta")?.includes("custom-beta"))
-    assert.ok(
-      headers.get("anthropic-beta")?.includes("redact-thinking-2026-02-12"),
-    )
-    assert.ok(
-      headers.get("anthropic-beta")?.includes("advanced-tool-use-2025-11-20"),
-    )
-    assert.ok(headers.get("anthropic-beta")?.includes("effort-2025-11-24"))
-    assert.equal(headers.get("x-anthropic-billing-header"), null)
-    assert.equal(
-      headers.get("anthropic-dangerous-direct-browser-access"),
-      "true",
-    )
-    assert.equal(headers.get("anthropic-version"), "2023-06-01")
-    assert.equal(headers.get("content-type"), "application/json")
-    assert.equal(
-      headers.get("user-agent"),
-      `claude-cli/${modelConfig.ccVersion} (external, cli)`,
-    )
-    assert.equal(headers.get("x-app"), "cli")
-    assert.equal(headers.get("x-claude-code-session-id"), "session-123")
-    assert.equal(headers.get("x-client-request-id"), "request-123")
-    assert.equal(headers.get("x-stainless-arch"), process.arch)
-    assert.equal(headers.get("x-stainless-lang"), "js")
-    assert.equal(
-      headers.get("x-stainless-os"),
-      getExpectedStainlessOs(process.platform),
-    )
-    assert.equal(headers.get("x-stainless-package-version"), "0.74.0")
-    assert.equal(headers.get("x-stainless-retry-count"), "0")
-    assert.equal(headers.get("x-stainless-runtime"), "node")
-    assert.equal(headers.get("x-stainless-runtime-version"), process.version)
-    assert.equal(headers.get("x-stainless-timeout"), "600")
+    try {
+      const headers = helpers.buildRequestHeaders(
+        "https://api.anthropic.com/v1/messages?beta=true",
+        {
+          headers: {
+            "anthropic-beta": "custom-beta",
+            "x-api-key": "old-key",
+            "x-custom": "keep-me",
+          },
+        },
+        "access-token",
+        "claude-sonnet-4-6",
+        undefined,
+        {
+          clientRequestId: "request-123",
+          sessionId: "session-123",
+        },
+      )
+
+      assert.equal(headers.get("authorization"), "Bearer access-token")
+      assert.equal(headers.get("accept"), "application/json")
+      assert.equal(headers.get("x-api-key"), null)
+      assert.equal(headers.get("x-custom"), "keep-me")
+      assert.ok(headers.get("anthropic-beta")?.includes("custom-beta"))
+      assert.ok(
+        headers.get("anthropic-beta")?.includes("redact-thinking-2026-02-12"),
+      )
+      assert.ok(
+        headers.get("anthropic-beta")?.includes("advanced-tool-use-2025-11-20"),
+      )
+      assert.ok(headers.get("anthropic-beta")?.includes("effort-2025-11-24"))
+      assert.equal(headers.get("x-anthropic-billing-header"), null)
+      assert.equal(
+        headers.get("anthropic-dangerous-direct-browser-access"),
+        "true",
+      )
+      assert.equal(headers.get("anthropic-version"), "2023-06-01")
+      assert.equal(headers.get("content-type"), "application/json")
+      assert.equal(
+        headers.get("user-agent"),
+        `claude-cli/${modelConfig.ccVersion} (external, cli)`,
+      )
+      assert.equal(headers.get("x-app"), "cli")
+      assert.equal(headers.get("x-claude-code-session-id"), "session-123")
+      assert.equal(headers.get("x-client-request-id"), "request-123")
+      assert.equal(headers.get("x-stainless-arch"), process.arch)
+      assert.equal(headers.get("x-stainless-lang"), "js")
+      assert.equal(
+        headers.get("x-stainless-os"),
+        getExpectedStainlessOs(process.platform),
+      )
+      assert.equal(headers.get("x-stainless-package-version"), "0.74.0")
+      assert.equal(headers.get("x-stainless-retry-count"), "0")
+      assert.equal(headers.get("x-stainless-runtime"), "node")
+      assert.equal(headers.get("x-stainless-runtime-version"), process.version)
+      assert.equal(headers.get("x-stainless-timeout"), "600")
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+    }
+  })
+
+  it("buildRequestHeaders omits x-client-request-id outside first-party provider", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+    process.env.ANTHROPIC_API_PROVIDER = "bedrock"
+
+    try {
+      const headers = helpers.buildRequestHeaders(
+        "https://api.anthropic.com/v1/messages?beta=true",
+        { headers: {} },
+        "access-token",
+        "claude-sonnet-4-6",
+        undefined,
+        {
+          clientRequestId: "request-123",
+          sessionId: "session-123",
+        },
+      )
+
+      assert.equal(headers.get("x-client-request-id"), null)
+      assert.equal(headers.get("x-claude-code-session-id"), "session-123")
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+    }
   })
 
   it("buildRequestHeaders strips unsupported effort beta for haiku models", () => {
@@ -854,10 +893,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
           .get("anthropic-beta")
           ?.includes("structured-outputs-2025-12-15"),
       )
-      assert.match(
-        String(headers.get("x-client-request-id")),
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
-      )
+      assert.equal(headers.get("x-client-request-id"), null)
       assert.match(
         String(headers.get("x-claude-code-session-id")),
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,

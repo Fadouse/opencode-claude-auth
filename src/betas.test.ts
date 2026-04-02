@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
+  getBedrockExtraBodyParamsBetas,
   getModelBetas,
   isLongContextError,
   supports1mContext,
@@ -257,6 +258,46 @@ describe("betas", () => {
     } finally {
       delete process.env.ANTHROPIC_BETA_FLAGS
       delete process.env.ANTHROPIC_ENABLE_1M_CONTEXT
+    }
+  })
+
+  it("getModelBetas filters Bedrock extra-body betas from the normal beta list", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+    process.env.ANTHROPIC_API_PROVIDER = "bedrock"
+
+    try {
+      const betas = getModelBetas("claude-sonnet-4-6")
+      assert.equal(
+        betas.includes("fine-grained-tool-streaming-2025-05-14"),
+        false,
+      )
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
+    }
+  })
+
+  it("getBedrockExtraBodyParamsBetas returns the Bedrock-only beta subset", () => {
+    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
+    process.env.ANTHROPIC_API_PROVIDER = "bedrock"
+
+    try {
+      const fullBetas = new Set(getModelBetas("claude-sonnet-4-6"))
+      delete process.env.ANTHROPIC_API_PROVIDER
+      const unfilteredBetas = getModelBetas("claude-sonnet-4-6")
+      process.env.ANTHROPIC_API_PROVIDER = "bedrock"
+
+      const expected = unfilteredBetas.filter((beta) => !fullBetas.has(beta))
+      assert.deepEqual(getBedrockExtraBodyParamsBetas("claude-sonnet-4-6"), expected)
+    } finally {
+      if (typeof originalProvider === "string") {
+        process.env.ANTHROPIC_API_PROVIDER = originalProvider
+      } else {
+        delete process.env.ANTHROPIC_API_PROVIDER
+      }
     }
   })
 })
