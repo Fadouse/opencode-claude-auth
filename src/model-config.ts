@@ -1,6 +1,7 @@
 export interface ModelOverride {
   exclude?: string[]
   add?: string[]
+  disableEffort?: boolean
 }
 
 export interface ModelConfig {
@@ -10,30 +11,29 @@ export interface ModelConfig {
   modelOverrides: Record<string, ModelOverride>
 }
 
-export const EFFORT_BETA = "effort-2025-11-24"
-export const STRUCTURED_OUTPUTS_BETA = "structured-outputs-2025-12-15"
-
 export const config: ModelConfig = {
-  ccVersion: "2.1.88",
+  ccVersion: "2.1.90",
   baseBetas: [
     "claude-code-20250219",
     "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
-    "redact-thinking-2026-02-12",
-    "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
-    "advanced-tool-use-2025-11-20",
+    "context-management-2025-06-27",
   ],
   longContextBetas: [
     "context-1m-2025-08-07",
     "interleaved-thinking-2025-05-14",
   ],
   modelOverrides: {
-    "opus-4-5": {
-      add: [EFFORT_BETA],
+    haiku: {
+      exclude: ["interleaved-thinking-2025-05-14"],
+      disableEffort: true,
     },
     "4-6": {
-      add: [EFFORT_BETA],
+      add: ["effort-2025-11-24"],
+    },
+    "4-7": {
+      add: ["effort-2025-11-24"],
     },
   },
 }
@@ -57,5 +57,5 @@ export function getModelOverride(modelId: string): ModelOverride | null {
 export function supportsEffort(modelId: string): boolean {
   if (!modelId) return false
   const override = getModelOverride(modelId)
-  return override?.add?.includes(EFFORT_BETA) ?? false
+  return override?.add?.includes("effort-2025-11-24") ?? false
 }

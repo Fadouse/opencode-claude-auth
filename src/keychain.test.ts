@@ -1,19 +1,23 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
-import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
+import { writeFileSync, mkdirSync, rmSync } from "node:fs"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { buildAccountLabels, readClaudeStateIdentity } from "./keychain.ts"
+import {
+  buildAccountLabels,
+  updateCredentialBlob,
+  writeBackCredentials,
+} from "./keychain.ts"
+import { chmodSync, statSync } from "node:fs"
+import { mkdtemp } from "node:fs/promises"
 
 // Mirrors the parseCredentials logic from keychain.ts for unit testing
 function parseCredentials(raw: string): {
   accessToken: string
   refreshToken: string
   expiresAt: number
-  accountUuid?: string
   subscriptionType?: string
-  userID?: string
 } | null {
   let parsed: unknown
   try {
@@ -22,25 +26,16 @@ function parseCredentials(raw: string): {
     return null
   }
 
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return null
+  const data = (parsed as { claudeAiOauth?: unknown }).claudeAiOauth ?? parsed
+  const creds = data as {
+    accessToken?: unknown
+    refreshToken?: unknown
+    expiresAt?: unknown
+    subscriptionType?: unknown
+    mcpOAuth?: unknown
   }
 
-  const root = parsed as Record<string, unknown>
-  const data =
-    typeof root.claudeAiOauth === "object" &&
-    root.claudeAiOauth !== null &&
-    !Array.isArray(root.claudeAiOauth)
-      ? (root.claudeAiOauth as Record<string, unknown>)
-      : root
-  const creds = data
-
-  if (
-    typeof root.mcpOAuth === "object" &&
-    root.mcpOAuth !== null &&
-    !Array.isArray(root.mcpOAuth) &&
-    typeof creds.accessToken !== "string"
-  ) {
+  if ((parsed as { mcpOAuth?: unknown }).mcpOAuth && !creds.accessToken) {
     return null
   }
 
@@ -56,22 +51,10 @@ function parseCredentials(raw: string): {
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
-    accountUuid:
-      typeof creds.accountUuid === "string"
-        ? creds.accountUuid
-        : typeof root.accountUuid === "string"
-          ? root.accountUuid
-          : undefined,
     subscriptionType:
       typeof creds.subscriptionType === "string"
         ? creds.subscriptionType
         : undefined,
-    userID:
-      typeof creds.userID === "string"
-        ? creds.userID
-        : typeof root.userID === "string"
-          ? root.userID
-          : undefined,
   }
 }
 
@@ -155,36 +138,6 @@ describe("parseCredentials", () => {
     const result = parseCredentials(raw)
     assert.ok(result)
     assert.equal(result.subscriptionType, undefined)
-  })
-
-  it("parses accountUuid and userID from the credential payload", () => {
-    const raw = JSON.stringify({
-      claudeAiOauth: {
-        accessToken: "at",
-        refreshToken: "rt",
-        expiresAt: 1700000000000,
-        accountUuid: "acct-123",
-        userID: "device-456",
-      },
-    })
-    const result = parseCredentials(raw)
-    assert.ok(result)
-    assert.equal(result.accountUuid, "acct-123")
-    assert.equal(result.userID, "device-456")
-  })
-
-  it("falls back to root-level accountUuid and userID when nested values are absent", () => {
-    const raw = JSON.stringify({
-      accessToken: "at",
-      refreshToken: "rt",
-      expiresAt: 1700000000000,
-      accountUuid: "acct-root",
-      userID: "device-root",
-    })
-    const result = parseCredentials(raw)
-    assert.ok(result)
-    assert.equal(result.accountUuid, "acct-root")
-    assert.equal(result.userID, "device-root")
   })
 
   it("returns null for MCP-only entries", () => {
@@ -441,9 +394,7 @@ describe("credentials file fallback", () => {
       accessToken: "file-at",
       refreshToken: "file-rt",
       expiresAt: 1700000000000,
-      accountUuid: undefined,
       subscriptionType: undefined,
-      userID: undefined,
     })
     rmSync(tmpDir, { recursive: true, force: true })
   })
@@ -475,27 +426,117 @@ describe("credentials file fallback", () => {
   })
 })
 
-describe("Claude state identity", () => {
-  it("reads official userID and accountUuid from ~/.claude/.claude.json", () => {
-    const tempHome = mkdtempSync(join(tmpdir(), "claude-state-home-"))
+describe("updateCredentialBlob", () => {
+  it("updates tokens in claudeAiOauth wrapper format", () => {
+    const existing = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "old-at",
+        refreshToken: "old-rt",
+        expiresAt: 1000,
+        scopes: ["user:inference"],
+        subscriptionType: "pro",
+      },
+    })
+    const newCreds = {
+      accessToken: "new-at",
+      refreshToken: "new-rt",
+      expiresAt: 2000,
+    }
+    const result = JSON.parse(updateCredentialBlob(existing, newCreds)!)
+    assert.equal(result.claudeAiOauth.accessToken, "new-at")
+    assert.equal(result.claudeAiOauth.refreshToken, "new-rt")
+    assert.equal(result.claudeAiOauth.expiresAt, 2000)
+    assert.deepEqual(result.claudeAiOauth.scopes, ["user:inference"])
+    assert.equal(result.claudeAiOauth.subscriptionType, "pro")
+  })
+
+  it("updates tokens in root-level format", () => {
+    const existing = JSON.stringify({
+      accessToken: "old-at",
+      refreshToken: "old-rt",
+      expiresAt: 1000,
+    })
+    const newCreds = {
+      accessToken: "new-at",
+      refreshToken: "new-rt",
+      expiresAt: 2000,
+    }
+    const result = JSON.parse(updateCredentialBlob(existing, newCreds)!)
+    assert.equal(result.accessToken, "new-at")
+    assert.equal(result.refreshToken, "new-rt")
+    assert.equal(result.expiresAt, 2000)
+  })
+
+  it("preserves mcpOAuth and other unrelated fields", () => {
+    const existing = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "old-at",
+        refreshToken: "old-rt",
+        expiresAt: 1000,
+      },
+      mcpOAuth: { "neon|abc": { serverName: "neon" } },
+    })
+    const newCreds = {
+      accessToken: "new-at",
+      refreshToken: "new-rt",
+      expiresAt: 2000,
+    }
+    const result = JSON.parse(updateCredentialBlob(existing, newCreds)!)
+    assert.ok(result.mcpOAuth)
+    assert.equal(result.mcpOAuth["neon|abc"].serverName, "neon")
+  })
+
+  it("returns null for invalid JSON input", () => {
+    assert.equal(
+      updateCredentialBlob("not json", {
+        accessToken: "a",
+        refreshToken: "r",
+        expiresAt: 1,
+      }),
+      null,
+    )
+  })
+})
+
+describe("writeBackCredentials (file source)", () => {
+  it("reads, updates, and writes back credentials to file", async () => {
     const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-wb-"))
+    process.env.HOME = tempHome
 
     try {
-      process.env.HOME = tempHome
       const claudeDir = join(tempHome, ".claude")
       mkdirSync(claudeDir, { recursive: true })
+      const credPath = join(claudeDir, ".credentials.json")
       writeFileSync(
-        join(claudeDir, ".claude.json"),
+        credPath,
         JSON.stringify({
-          userID: "device-primary",
-          oauthAccount: { accountUuid: "acct-primary" },
+          claudeAiOauth: {
+            accessToken: "old-at",
+            refreshToken: "old-rt",
+            expiresAt: 1000,
+            subscriptionType: "pro",
+          },
         }),
+        { encoding: "utf-8", mode: 0o600 },
       )
 
-      assert.deepEqual(readClaudeStateIdentity(), {
-        accountUuid: "acct-primary",
-        userID: "device-primary",
+      const result = writeBackCredentials("file", {
+        accessToken: "new-at",
+        refreshToken: "new-rt",
+        expiresAt: 2000,
       })
+
+      assert.equal(result, true)
+      const written = JSON.parse(readFileSync(credPath, "utf-8"))
+      assert.equal(written.claudeAiOauth.accessToken, "new-at")
+      assert.equal(written.claudeAiOauth.refreshToken, "new-rt")
+      assert.equal(written.claudeAiOauth.expiresAt, 2000)
+      assert.equal(
+        written.claudeAiOauth.subscriptionType,
+        "pro",
+        "should preserve other fields",
+      )
     } finally {
       if (typeof originalHome === "string") {
         process.env.HOME = originalHome
@@ -506,33 +547,86 @@ describe("Claude state identity", () => {
     }
   })
 
-  it("falls back to the latest ~/.claude/backups/.claude.json.backup.* file", () => {
-    const tempHome = mkdtempSync(join(tmpdir(), "claude-state-backup-home-"))
+  it("writes file with 0o600 permissions", async () => {
+    if (process.platform === "win32") return
+
     const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(
+      join(tmpdir(), "opencode-claude-auth-wb-perms-"),
+    )
+    process.env.HOME = tempHome
 
     try {
-      process.env.HOME = tempHome
-      const backupDir = join(tempHome, ".claude", "backups")
-      mkdirSync(backupDir, { recursive: true })
+      const claudeDir = join(tempHome, ".claude")
+      mkdirSync(claudeDir, { recursive: true })
+      const credPath = join(claudeDir, ".credentials.json")
       writeFileSync(
-        join(backupDir, ".claude.json.backup.1700000000000"),
-        JSON.stringify({
-          userID: "device-old",
-          oauthAccount: { accountUuid: "acct-old" },
-        }),
+        credPath,
+        JSON.stringify({ accessToken: "at", refreshToken: "rt", expiresAt: 1 }),
+        { encoding: "utf-8", mode: 0o644 },
       )
-      writeFileSync(
-        join(backupDir, ".claude.json.backup.1700000000001"),
-        JSON.stringify({
-          userID: "device-new",
-          oauthAccount: { accountUuid: "acct-new" },
-        }),
-      )
+      chmodSync(credPath, 0o644)
 
-      assert.deepEqual(readClaudeStateIdentity(), {
-        accountUuid: "acct-new",
-        userID: "device-new",
+      writeBackCredentials("file", {
+        accessToken: "new-at",
+        refreshToken: "new-rt",
+        expiresAt: 2000,
       })
+
+      const mode = statSync(credPath).mode & 0o777
+      assert.equal(mode, 0o600, `Expected 0o600, got 0o${mode.toString(8)}`)
+    } finally {
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
+
+  it("returns false when credentials file does not exist", async () => {
+    const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(
+      join(tmpdir(), "opencode-claude-auth-wb-missing-"),
+    )
+    process.env.HOME = tempHome
+
+    try {
+      const result = writeBackCredentials("file", {
+        accessToken: "at",
+        refreshToken: "rt",
+        expiresAt: 1000,
+      })
+      assert.equal(result, false)
+    } finally {
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
+
+  it("returns false when credentials file contains invalid JSON", async () => {
+    const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(
+      join(tmpdir(), "opencode-claude-auth-wb-invalid-"),
+    )
+    process.env.HOME = tempHome
+
+    try {
+      const claudeDir = join(tempHome, ".claude")
+      mkdirSync(claudeDir, { recursive: true })
+      writeFileSync(join(claudeDir, ".credentials.json"), "not json {")
+
+      const result = writeBackCredentials("file", {
+        accessToken: "at",
+        refreshToken: "rt",
+        expiresAt: 1000,
+      })
+      assert.equal(result, false)
     } finally {
       if (typeof originalHome === "string") {
         process.env.HOME = originalHome

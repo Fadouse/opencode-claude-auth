@@ -1,11 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { randomUUID } from "node:crypto"
-import { config, EFFORT_BETA, supportsEffort } from "./model-config.ts"
-import {
-  readAllClaudeAccounts,
-  readClaudeStateIdentity,
-  type ClaudeAccount,
-} from "./keychain.ts"
+import crypto from "node:crypto"
+import { config } from "./model-config.ts"
+import { readAllClaudeAccounts, type ClaudeAccount } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
 import {
   addExcludedBeta,
@@ -15,16 +11,11 @@ import {
   isLongContextError,
   LONG_CONTEXT_BETAS,
 } from "./betas.ts"
-import {
-  markToolsSentToAPIState,
-  recordLastApiCompletionTimestamp,
-  transformBody,
-  transformResponseStream,
-  type TransformContext,
-} from "./transforms.ts"
-import { getWorkload } from "./workload.ts"
+import { transformBody, transformResponseStream } from "./transforms.ts"
+import { applyOpencodeConfig } from "./plugin-config.ts"
 import {
   getCachedCredentials,
+  getCredentialsForSync,
   syncAuthJson,
   initAccounts,
   setActiveAccountSource,
@@ -54,121 +45,30 @@ export {
   refreshAccountsList,
   type ClaudeCredentials,
 } from "./credentials.ts"
+export { isEnable1mContext, type PluginSettings } from "./plugin-config.ts"
+export {
+  buildBillingHeaderValue,
+  computeCch,
+  computeVersionSuffix,
+  extractFirstUserMessageText,
+} from "./signing.ts"
 
-const DEFAULT_SYSTEM_IDENTITY_PREFIX =
+const SYSTEM_IDENTITY_PREFIX =
   "You are Claude Code, Anthropic's official CLI for Claude."
-const OFFICIAL_MESSAGES_URL = "https://api.anthropic.com/v1/messages?beta=true"
-const ANTHROPIC_VERSION = "2023-06-01"
-const REQUEST_TIMEOUT_SECONDS = "600"
-const STAINLESS_LANGUAGE = "js"
-const STAINLESS_OS_NAMES: Record<NodeJS.Platform, string> = {
-  aix: "AIX",
-  android: "Android",
-  darwin: "MacOS",
-  freebsd: "FreeBSD",
-  haiku: "Haiku",
-  linux: "Linux",
-  openbsd: "OpenBSD",
-  sunos: "SunOS",
-  win32: "Windows",
-  cygwin: "Windows",
-  netbsd: "NetBSD",
-}
-const STAINLESS_PACKAGE_VERSION = "0.74.0"
 
 function getCliVersion(): string {
-  return config.ccVersion
+  return process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion
 }
 
 function getUserAgent(): string {
-  const userType = process.env.USER_TYPE ?? "external"
-  const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? "cli"
-  const workload = getWorkload()
-  const workloadSuffix = workload ? `, workload/${workload}` : ""
-
-  return `claude-cli/${getCliVersion()} (${userType}, ${entrypoint}${workloadSuffix})`
+  return (
+    process.env.ANTHROPIC_USER_AGENT ??
+    `claude-cli/${getCliVersion()} (external, cli)`
+  )
 }
 
-function getStainlessOs(): string {
-  return STAINLESS_OS_NAMES[process.platform] ?? process.platform
-}
-
-function buildClientRequestId(): string {
-  return randomUUID()
-}
-
-function shouldSendClientRequestId(): boolean {
-  return process.env.ANTHROPIC_API_PROVIDER === "firstParty"
-}
-
-function filterModelCapabilityBetas(
-  modelId: string,
-  betas: string[],
-): string[] {
-  if (supportsEffort(modelId)) {
-    return betas
-  }
-
-  return betas.filter((beta) => beta !== EFFORT_BETA)
-}
-
-function normalizeAnthropicMessagesInput(
-  input: RequestInfo | URL,
-): RequestInfo | URL {
-  let url: URL
-
-  try {
-    if (input instanceof Request) {
-      url = new URL(input.url)
-    } else if (input instanceof URL) {
-      url = new URL(input.toString())
-    } else {
-      url = new URL(input)
-    }
-  } catch {
-    return input
-  }
-
-  if (
-    url.origin !== "https://api.anthropic.com" ||
-    url.pathname !== "/v1/messages"
-  ) {
-    return input
-  }
-
-  const normalizedUrl = OFFICIAL_MESSAGES_URL
-
-  if (input instanceof Request) {
-    return new Request(normalizedUrl, input)
-  }
-
-  if (input instanceof URL) {
-    return new URL(normalizedUrl)
-  }
-
-  return normalizedUrl
-}
-
-function buildTransformContext(
-  credentials: ClaudeCredentials,
-  sessionId: string,
-): TransformContext {
-  const stateIdentity = readClaudeStateIdentity()
-  const deviceId = stateIdentity?.userID ?? credentials.userID
-
-  if (!deviceId) {
-    throw new Error(
-      "Claude Code official device_id is unavailable. Run `claude` once so ~/.claude/.claude.json can be initialized.",
-    )
-  }
-
-  return {
-    accountUuid: stateIdentity?.accountUuid ?? credentials.accountUuid,
-    cliVersion: getCliVersion(),
-    deviceId,
-    sessionId,
-  }
-}
+// Stable per-process session ID, matching Claude Code's X-Claude-Code-Session-Id
+const sessionId = crypto.randomUUID()
 
 type FetchFn = typeof fetch
 
@@ -184,6 +84,12 @@ export async function fetchWithRetry(
       const retryAfter = res.headers.get("retry-after")
       const parsed = retryAfter ? parseInt(retryAfter, 10) : NaN
       const delay = Number.isNaN(parsed) ? (i + 1) * 2000 : parsed * 1000
+      log("fetch_rate_limited", {
+        status: res.status,
+        attempt: i + 1,
+        retryAfter: retryAfter ?? "none",
+        delayMs: delay,
+      })
       await new Promise((r) => setTimeout(r, delay))
       continue
     }
@@ -198,7 +104,6 @@ export function buildRequestHeaders(
   accessToken: string,
   modelId = "unknown",
   excludedBetas?: Set<string>,
-  requestContext?: { clientRequestId?: string; sessionId?: string },
 ): Headers {
   const headers = new Headers()
 
@@ -237,39 +142,14 @@ export function buildRequestHeaders(
         .filter(Boolean),
     ]),
   ]
-  const capabilityFilteredBetas = filterModelCapabilityBetas(
-    modelId,
-    mergedBetas,
-  )
 
   headers.set("authorization", `Bearer ${accessToken}`)
-  headers.set("accept", "application/json")
-  headers.set("anthropic-beta", capabilityFilteredBetas.join(","))
-  headers.set("anthropic-dangerous-direct-browser-access", "true")
-  headers.set("anthropic-version", ANTHROPIC_VERSION)
-  headers.set("content-type", "application/json")
+  headers.set("anthropic-version", "2023-06-01")
+  headers.set("anthropic-beta", mergedBetas.join(","))
   headers.set("x-app", "cli")
-  headers.set(
-    "x-claude-code-session-id",
-    requestContext?.sessionId ?? randomUUID(),
-  )
-  if (shouldSendClientRequestId()) {
-    headers.set(
-      "x-client-request-id",
-      requestContext?.clientRequestId ?? buildClientRequestId(),
-    )
-  } else {
-    headers.delete("x-client-request-id")
-  }
-  headers.set("x-stainless-arch", process.arch)
-  headers.set("x-stainless-lang", STAINLESS_LANGUAGE)
-  headers.set("x-stainless-os", getStainlessOs())
-  headers.set("x-stainless-package-version", STAINLESS_PACKAGE_VERSION)
-  headers.set("x-stainless-retry-count", "0")
-  headers.set("x-stainless-runtime", "node")
-  headers.set("x-stainless-runtime-version", process.version)
-  headers.set("x-stainless-timeout", REQUEST_TIMEOUT_SECONDS)
   headers.set("user-agent", getUserAgent())
+  headers.set("x-client-request-id", crypto.randomUUID())
+  headers.set("X-Claude-Code-Session-Id", sessionId)
   headers.delete("x-api-key")
 
   return headers
@@ -279,9 +159,6 @@ const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
 
 const plugin: Plugin = async () => {
   initLogger()
-  process.env.CLAUDE_CODE_ENTRYPOINT ??= "cli"
-  process.env.USER_TYPE ??= "external"
-  const sessionId = randomUUID()
 
   let accounts: ClaudeAccount[] = []
   try {
@@ -296,61 +173,64 @@ const plugin: Plugin = async () => {
     return {}
   }
 
-  if (accounts.length === 0) {
-    log("plugin_init_no_accounts", { reason: "no credentials found" })
-    console.warn(
-      "opencode-claude-auth: No Claude Code credentials found. " +
-        "Plugin disabled. Run `claude` to authenticate.",
-    )
-    return {}
-  }
-
   initAccounts(accounts)
 
-  const persistedSource = loadPersistedAccountSource()
-  const defaultAccount =
-    (persistedSource && accounts.find((a) => a.source === persistedSource)) ||
-    accounts[0]
+  const defaultAccountSource = accounts[0]?.source ?? null
 
-  setActiveAccountSource(defaultAccount.source)
+  if (accounts.length > 0) {
+    const persistedSource = loadPersistedAccountSource()
+    const defaultAccount =
+      (persistedSource && accounts.find((a) => a.source === persistedSource)) ||
+      accounts[0]
 
-  log("plugin_init", {
-    accountCount: accounts.length,
-    sources: accounts.map((a) => a.source),
-    activeSource: defaultAccount.source,
-  })
+    setActiveAccountSource(defaultAccount.source)
 
-  const initialCreds = getCachedCredentials()
-  if (initialCreds) {
-    syncAuthJson(initialCreds)
+    log("plugin_init", {
+      accountCount: accounts.length,
+      sources: accounts.map((a) => a.source),
+      activeSource: defaultAccount.source,
+    })
+
+    const initialCreds = getCachedCredentials()
+    if (initialCreds) {
+      syncAuthJson(initialCreds)
+    } else {
+      console.warn(
+        "opencode-claude-auth: Claude credentials are expired and could not be refreshed. Run `claude` to re-authenticate.",
+      )
+    }
+
+    // Keep auth.json synced with current credentials (no refresh triggered)
+    const syncTimer = setInterval(() => {
+      try {
+        const creds = getCredentialsForSync()
+        if (creds) syncAuthJson(creds)
+      } catch {
+        // Non-fatal
+      }
+    }, SYNC_INTERVAL)
+    syncTimer.unref()
   } else {
+    log("plugin_init_no_accounts", { reason: "no credentials found" })
     console.warn(
-      "opencode-claude-auth: Claude credentials are expired and could not be refreshed via Claude CLI.",
+      "opencode-claude-auth: No Claude Code credentials found. Running in API key mode with transform hook enabled.",
     )
   }
 
-  // Keep auth.json synced, refreshing via CLI if token is near expiry
-  const syncTimer = setInterval(() => {
-    try {
-      const fresh = getCachedCredentials()
-      if (fresh) syncAuthJson(fresh)
-    } catch {
-      // Non-fatal
-    }
-  }, SYNC_INTERVAL)
-  syncTimer.unref()
-
   return {
+    config: async (opencodeConfig) => {
+      applyOpencodeConfig(opencodeConfig)
+    },
     "experimental.chat.system.transform": async (input, output) => {
       if (input.model?.providerID !== "anthropic") {
         return
       }
 
       const hasIdentityPrefix = output.system.some((entry) =>
-        entry.includes(DEFAULT_SYSTEM_IDENTITY_PREFIX),
+        entry.includes(SYSTEM_IDENTITY_PREFIX),
       )
       if (!hasIdentityPrefix) {
-        output.system.unshift(DEFAULT_SYSTEM_IDENTITY_PREFIX)
+        output.system.unshift(SYSTEM_IDENTITY_PREFIX)
       }
     },
     auth: {
@@ -380,8 +260,8 @@ const plugin: Plugin = async () => {
 
         return {
           apiKey: "",
+          baseURL: "https://api.anthropic.com/v1",
           async fetch(input: RequestInfo | URL, init?: RequestInit) {
-            const normalizedInput = normalizeAnthropicMessagesInput(input)
             const latest = getCachedCredentials()
             if (!latest) {
               log("fetch_no_credentials", { modelId: "unknown" })
@@ -409,22 +289,16 @@ const plugin: Plugin = async () => {
               expiresAt: latest.expiresAt,
             })
 
-            const clientRequestId = buildClientRequestId()
-
             // Get excluded betas for this model (from previous failed requests)
             const excluded = getExcludedBetas(modelId)
             const headers = buildRequestHeaders(
-              normalizedInput,
+              input,
               requestInit,
               latest.accessToken,
               modelId,
               excluded,
-              { clientRequestId, sessionId },
             )
-            const body = transformBody(
-              requestInit.body,
-              buildTransformContext(latest, sessionId),
-            )
+            const body = transformBody(requestInit.body)
 
             const headerKeys: string[] = []
             headers.forEach((_, key) => headerKeys.push(key))
@@ -433,7 +307,7 @@ const plugin: Plugin = async () => {
               .filter(Boolean)
             log("fetch_headers_built", { headerKeys, betas, modelId })
 
-            let response = await fetchWithRetry(normalizedInput, {
+            let response = await fetchWithRetry(input, {
               ...requestInit,
               body,
               headers,
@@ -444,6 +318,31 @@ const plugin: Plugin = async () => {
               modelId,
               retryAttempt: 0,
             })
+
+            // On 401, force a credential refresh and retry once.
+            // This handles the common case of token expiry mid-session.
+            if (response.status === 401) {
+              log("fetch_401_retry", { modelId })
+              const refreshed = getCachedCredentials()
+              if (refreshed && refreshed.accessToken !== latest.accessToken) {
+                const retryHeaders = buildRequestHeaders(
+                  input,
+                  requestInit,
+                  refreshed.accessToken,
+                  modelId,
+                  excluded,
+                )
+                response = await fetchWithRetry(input, {
+                  ...requestInit,
+                  body,
+                  headers: retryHeaders,
+                })
+                log("fetch_401_retry_result", {
+                  status: response.status,
+                  modelId,
+                })
+              }
+            }
 
             // Check for long-context beta errors and retry with betas excluded
             // Try up to LONG_CONTEXT_BETAS.length times, excluding one more beta each time
@@ -475,31 +374,45 @@ const plugin: Plugin = async () => {
               })
 
               // Rebuild headers without the excluded beta and retry
+              const currentCreds = getCachedCredentials()
+              const retryToken = currentCreds?.accessToken ?? latest.accessToken
               const newExcluded = getExcludedBetas(modelId)
               const newHeaders = buildRequestHeaders(
-                normalizedInput,
+                input,
                 requestInit,
-                latest.accessToken,
+                retryToken,
                 modelId,
                 newExcluded,
-                { clientRequestId, sessionId },
               )
 
-              response = await fetchWithRetry(normalizedInput, {
+              response = await fetchWithRetry(input, {
                 ...requestInit,
                 body,
                 headers: newHeaders,
               })
             }
 
-            // Official source citation:
-            // - `.inspect-claude-code-2.1.88/src/services/compact/microCompact.ts:124-127`
-            //   defines `markToolsSentToAPIState()`.
-            // - `.inspect-claude-code-2.1.88/src/services/api/claude.ts:2833-2836`
-            //   calls it after the successful API response flow.
-            if (response.ok) {
-              markToolsSentToAPIState()
-              recordLastApiCompletionTimestamp()
+            // Log non-200 responses at warn level so they're visible in OpenCode
+            if (!response.ok) {
+              const status = response.status
+              const cloned = response.clone()
+              cloned
+                .text()
+                .then((errorBody) => {
+                  let message = errorBody
+                  try {
+                    const parsed = JSON.parse(errorBody) as {
+                      error?: { type?: string; message?: string }
+                    }
+                    message =
+                      parsed.error?.message ?? parsed.error?.type ?? errorBody
+                  } catch {}
+                  log("fetch_error_response", { status, modelId, message })
+                  console.warn(
+                    `opencode-claude-auth: API ${status} for ${modelId}: ${message}`,
+                  )
+                })
+                .catch(() => {})
             }
 
             return transformResponseStream(response)
@@ -514,7 +427,7 @@ const plugin: Plugin = async () => {
           get prompts() {
             const currentAccounts = refreshAccountsList()
             const currentSource =
-              loadPersistedAccountSource() ?? defaultAccount.source
+              loadPersistedAccountSource() ?? defaultAccountSource
             if (currentAccounts.length <= 1) return []
             return [
               {

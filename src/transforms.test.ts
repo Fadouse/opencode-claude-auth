@@ -1,63 +1,20 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
-  buildBillingHeaderValue,
-  buildBillingSystemText,
-  computeCch,
-  computeSeededCchHash,
-  consumePendingCacheEdits,
-  fillCchInSerializedBody,
-  getPromptMarker,
-  getAttributionHeader,
-  getPinnedCacheEdits,
-  isAttributionHeaderEnabled,
-  markToolsSentToAPIState,
-  pinCacheEdits,
-  recordLastApiCompletionTimestamp,
-  resetPromptCache1hLatchState,
-  resetThinkingClearLatchState,
-  resetMicrocompactState,
+  repairToolPairs,
   stripToolPrefix,
   transformBody,
   transformResponseStream,
 } from "./transforms.ts"
-import { runWithWorkload } from "./workload.ts"
 
 describe("transforms", () => {
-  it("cached-MC lifecycle helpers implement consume, pin, mark, and reset state", () => {
-    resetMicrocompactState()
-
-    assert.equal(consumePendingCacheEdits(), null)
-    assert.deepEqual(getPinnedCacheEdits(), [])
-
-    pinCacheEdits(2, {
-      type: "cache_edits",
-      edits: [{ old_text: "before", new_text: "after" }],
-    })
-
-    assert.deepEqual(getPinnedCacheEdits(), [
-      {
-        userMessageIndex: 2,
-        block: {
-          type: "cache_edits",
-          edits: [{ old_text: "before", new_text: "after" }],
-        },
-      },
-    ])
-
-    markToolsSentToAPIState()
-    assert.equal(consumePendingCacheEdits(), null)
-
-    resetMicrocompactState()
-    assert.deepEqual(getPinnedCacheEdits(), [])
-    assert.equal(consumePendingCacheEdits(), null)
-  })
-
-  it("transformBody preserves system text and prefixes tool names", () => {
+  it("transformBody moves non-core system text to user message and PascalCase-prefixes tool names", () => {
     const input = JSON.stringify({
       system: [{ type: "text", text: "OpenCode and opencode" }],
       tools: [{ name: "search" }],
-      messages: [{ content: [{ type: "tool_use", name: "lookup" }] }],
+      messages: [
+        { role: "user", content: [{ type: "tool_use", name: "lookup" }] },
+      ],
     })
 
     const output = transformBody(input)
@@ -65,15 +22,25 @@ describe("transforms", () => {
     const parsed = JSON.parse(output as string) as {
       system: Array<{ text: string }>
       tools: Array<{ name: string }>
-      messages: Array<{ content: Array<{ name: string }> }>
+      messages: Array<{
+        content: Array<{ type?: string; text?: string; name?: string }>
+      }>
     }
 
-    assert.equal(parsed.system[0].text, "OpenCode and opencode")
-    assert.equal(parsed.tools[0].name, "mcp_search")
-    assert.equal(parsed.messages[0].content[0].name, "mcp_lookup")
+    // system should only contain the billing header (non-core text relocated)
+    assert.equal(parsed.system.length, 1)
+    assert.ok(
+      parsed.system[0].text.startsWith("x-anthropic-billing-header:"),
+      "system[0] should be the billing header",
+    )
+    // The original system text should now be prepended to the first user message
+    assert.equal(parsed.messages[0].content[0].type, "text")
+    assert.equal(parsed.messages[0].content[0].text, "OpenCode and opencode")
+    assert.equal(parsed.tools[0].name, "mcp_Search")
+    assert.equal(parsed.messages[0].content[1].name, "mcp_Lookup")
   })
 
-  it("transformBody keeps opencode-claude-auth system text unchanged", () => {
+  it("transformBody relocates non-core system text to user message", () => {
     const input = JSON.stringify({
       system: [
         {
@@ -81,21 +48,26 @@ describe("transforms", () => {
           text: "Use opencode-claude-auth plugin instructions as-is.",
         },
       ],
+      messages: [{ role: "user", content: "hello" }],
     })
 
     const output = transformBody(input)
     assert.equal(typeof output, "string")
     const parsed = JSON.parse(output as string) as {
       system: Array<{ text: string }>
+      messages: Array<{ content: string }>
     }
 
-    assert.equal(
-      parsed.system[0].text,
-      "Use opencode-claude-auth plugin instructions as-is.",
+    // Non-core system text should be moved to user message
+    assert.equal(parsed.system.length, 1) // only billing header
+    assert.ok(
+      parsed.messages[0].content.includes(
+        "Use opencode-claude-auth plugin instructions as-is.",
+      ),
     )
   })
 
-  it("transformBody keeps OpenCode and opencode URL/path text unchanged", () => {
+  it("transformBody relocates URL/path system text to user message", () => {
     const input = JSON.stringify({
       system: [
         {
@@ -103,1273 +75,503 @@ describe("transforms", () => {
           text: "OpenCode docs: https://example.com/opencode/docs and path /var/opencode/bin",
         },
       ],
+      messages: [{ role: "user", content: "hello" }],
     })
 
     const output = transformBody(input)
     assert.equal(typeof output, "string")
     const parsed = JSON.parse(output as string) as {
       system: Array<{ text: string }>
+      messages: Array<{ content: string }>
     }
 
-    assert.equal(
-      parsed.system[0].text,
-      "OpenCode docs: https://example.com/opencode/docs and path /var/opencode/bin",
+    // Non-core system text should be relocated
+    assert.equal(parsed.system.length, 1) // only billing header
+    assert.ok(
+      parsed.messages[0].content.includes(
+        "OpenCode docs: https://example.com/opencode/docs and path /var/opencode/bin",
+      ),
     )
   })
 
-  it("getPromptMarker derives a stable 3-hex marker from first user text and version", () => {
-    const markerA = getPromptMarker("Hello from request body", "2.1.88")
-    const markerB = getPromptMarker("Hello from request body", "2.1.88")
-    const markerC = getPromptMarker("Different user message", "2.1.88")
+  it("transformBody injects billing header as system[0] with computed cch", () => {
+    const input = JSON.stringify({
+      system: [{ type: "text", text: "system prompt" }],
+      messages: [{ role: "user", content: "hey" }],
+    })
 
-    assert.equal(markerA, markerB)
-    assert.match(markerA, /^[0-9a-f]{3}$/u)
-    assert.notEqual(markerA, markerC)
-  })
-
-  it("buildBilling helpers format the recovered billing text", () => {
-    const originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
-    delete process.env.CLAUDE_CODE_ENTRYPOINT
-
-    try {
-      const headerValue = buildBillingHeaderValue(
-        "Hello from request body",
-        "2.1.88",
-      )
-      assert.match(
-        headerValue,
-        /^cc_version=2\.1\.88\.[0-9a-f]{3}; cc_entrypoint=unknown; cch=00000;$/u,
-      )
-      assert.equal(
-        buildBillingSystemText("Hello from request body", "2.1.88"),
-        `x-anthropic-billing-header: ${headerValue}`,
-      )
-    } finally {
-      if (typeof originalEntrypoint === "string") {
-        process.env.CLAUDE_CODE_ENTRYPOINT = originalEntrypoint
-      } else {
-        delete process.env.CLAUDE_CODE_ENTRYPOINT
-      }
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
     }
+
+    assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
+    assert.ok(
+      parsed.system[0].text.includes("cch=3a24d"),
+      `Expected cch=3a24d for the transformed request, got: ${parsed.system[0].text}`,
+    )
   })
 
-  it("getAttributionHeader appends cc_workload when workload context is present", () => {
-    const originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
-    process.env.CLAUDE_CODE_ENTRYPOINT = "cli"
+  it("transformBody billing header has no cache_control", () => {
+    const input = JSON.stringify({
+      system: [
+        { type: "text", text: "prompt", cache_control: { type: "ephemeral" } },
+      ],
+      messages: [{ role: "user", content: "test" }],
+    })
 
-    try {
-      const header = runWithWorkload("cron", () =>
-        getAttributionHeader("Hello from request body", "2.1.88"),
-      )
-      assert.match(
-        header,
-        /^x-anthropic-billing-header: cc_version=2\.1\.88\.[0-9a-f]{3}; cc_entrypoint=cli; cch=00000; cc_workload=cron;$/u,
-      )
-    } finally {
-      if (typeof originalEntrypoint === "string") {
-        process.env.CLAUDE_CODE_ENTRYPOINT = originalEntrypoint
-      } else {
-        delete process.env.CLAUDE_CODE_ENTRYPOINT
-      }
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string; cache_control?: unknown }>
     }
+
+    // Billing header (system[0]) should not have cache_control
+    assert.equal(
+      parsed.system[0].cache_control,
+      undefined,
+      "Billing header must not have cache_control",
+    )
   })
 
-  it("CLAUDE_CODE_ATTRIBUTION_HEADER=0 disables attribution header injection", () => {
-    const originalAttribution = process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
-    process.env.CLAUDE_CODE_ATTRIBUTION_HEADER = "0"
-
-    try {
-      assert.equal(isAttributionHeaderEnabled(), false)
-      assert.equal(
-        getAttributionHeader("Hello from request body", "2.1.88"),
-        "",
-      )
-
-      const input = JSON.stringify({
-        system: [{ type: "text", text: "Existing system" }],
-        messages: [{ role: "user", content: "Hello from request body" }],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-      assert.equal(typeof output, "string")
-
-      const parsed = JSON.parse(output as string) as {
-        system: Array<{
-          text: string
-          type: string
-          cache_control?: { type: string }
-        }>
-      }
-      assert.deepEqual(parsed.system, [
+  it("transformBody splits concatenated identity prefix and relocates remainder to user message", () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+    const input = JSON.stringify({
+      system: [
         {
           type: "text",
-          text: "Existing system",
-          cache_control: { type: "ephemeral" },
+          text: `${identity}\nWorking directory: /home/test`,
         },
-      ])
-    } finally {
-      if (typeof originalAttribution === "string") {
-        process.env.CLAUDE_CODE_ATTRIBUTION_HEADER = originalAttribution
-      } else {
-        delete process.env.CLAUDE_CODE_ATTRIBUTION_HEADER
-      }
-    }
-  })
-
-  it("transformBody injects billing text and metadata.user_id when context is provided", () => {
-    const originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
-    process.env.CLAUDE_CODE_EXTRA_METADATA = JSON.stringify({
-      workspace: "repo",
-    })
-    delete process.env.CLAUDE_CODE_ENTRYPOINT
-
-    try {
-      const input = JSON.stringify({
-        metadata: { trace_id: "trace-1" },
-        system: [{ type: "text", text: "Existing system" }],
-        messages: [{ role: "user", content: "Hello from request body" }],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-      assert.equal(typeof output, "string")
-
-      const parsed = JSON.parse(output as string) as {
-        metadata: { trace_id: string; user_id: string }
-        system: Array<{ text: string; type: string; cache_control?: { type: string } }>
-      }
-
-      assert.match(
-        parsed.system[0].text,
-        /^x-anthropic-billing-header: cc_version=2\.1\.88\.[0-9a-f]{3}; cc_entrypoint=unknown; cch=[0-9a-f]{5};$/u,
-      )
-      assert.deepEqual(parsed.system[1], {
-        type: "text",
-        text: "Existing system",
-        cache_control: { type: "ephemeral" },
-      })
-      assert.equal(parsed.metadata.trace_id, "trace-1")
-      assert.deepEqual(JSON.parse(parsed.metadata.user_id), {
-        workspace: "repo",
-        device_id: "device-456",
-        account_uuid: "acct-123",
-        session_id: "session-789",
-      })
-    } finally {
-      if (typeof originalEntrypoint === "string") {
-        process.env.CLAUDE_CODE_ENTRYPOINT = originalEntrypoint
-      } else {
-        delete process.env.CLAUDE_CODE_ENTRYPOINT
-      }
-      delete process.env.CLAUDE_CODE_EXTRA_METADATA
-    }
-  })
-
-  it("transformBody reorders top-level request keys to match official request shape", () => {
-    const input = JSON.stringify({
-      stream: true,
-      output_config: { effort: "medium" },
-      max_tokens: 64000,
-      temperature: 1,
-      metadata: { trace_id: "trace-1" },
-      system: "Existing system",
-      messages: [{ role: "user", content: "Hello from request body" }],
-      model: "claude-opus-4-6",
+      ],
+      messages: [{ role: "user", content: "test" }],
     })
 
-    const output = transformBody(input, {
-      accountUuid: "acct-123",
-      cliVersion: "2.1.88",
-      deviceId: "device-456",
-      sessionId: "session-789",
-    })
-
-    assert.equal(typeof output, "string")
-    const parsed = JSON.parse(output as string) as Record<string, unknown>
-    assert.deepEqual(Object.keys(parsed), [
-      "model",
-      "messages",
-      "system",
-      "metadata",
-      "max_tokens",
-      "temperature",
-      "output_config",
-      "stream",
-    ])
-  })
-
-  it("transformBody places extra body params after context_management and before output_config", () => {
-    const input = JSON.stringify({
-      model: "claude-opus-4-6",
-      messages: [{ role: "user", content: "Hello from request body" }],
-      system: "Existing system",
-      metadata: { trace_id: "trace-1" },
-      max_tokens: 64000,
-      context_management: { mode: "auto" },
-      custom_extra_body_param: { enabled: true },
-      output_config: { format: { type: "json_schema", schema: { type: "object" } } },
-      speed: "fast",
-      stream: true,
-    })
-
-    const output = transformBody(input, {
-      accountUuid: "acct-123",
-      cliVersion: "2.1.88",
-      deviceId: "device-456",
-      sessionId: "session-789",
-    })
-
-    assert.equal(typeof output, "string")
-    const parsed = JSON.parse(output as string) as Record<string, unknown>
-
-    assert.deepEqual(Object.keys(parsed), [
-      "model",
-      "messages",
-      "system",
-      "metadata",
-      "max_tokens",
-      "context_management",
-      "custom_extra_body_param",
-      "output_config",
-      "speed",
-      "stream",
-    ])
-  })
-
-  it("transformBody applies CLAUDE_CODE_EXTRA_BODY using official extraBodyParams semantics", () => {
-    const originalExtraBody = process.env.CLAUDE_CODE_EXTRA_BODY
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-
-    process.env.CLAUDE_CODE_EXTRA_BODY = JSON.stringify({
-      anthropic_beta: ["bedrock-beta-a"],
-      context_management: { mode: "manual" },
-      custom_extra_body_param: { enabled: true },
-      output_config: { format: { type: "json_schema", schema: { type: "object" } } },
-      speed: "slow",
-    })
-    process.env.ANTHROPIC_API_PROVIDER = "bedrock"
-
-    try {
-      const input = JSON.stringify({
-        max_tokens: 64000,
-        messages: [{ role: "user", content: "Hello from request body" }],
-        model: "claude-opus-4-6",
-        output_config: { effort: "medium" },
-        speed: "fast",
-        stream: true,
-        system: "Existing system",
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as Record<string, unknown>
-
-      assert.deepEqual(Object.keys(parsed), [
-        "model",
-        "messages",
-        "system",
-        "metadata",
-        "max_tokens",
-        "context_management",
-        "anthropic_beta",
-        "custom_extra_body_param",
-        "output_config",
-        "speed",
-        "stream",
-      ])
-      assert.deepEqual(parsed.context_management, { mode: "manual" })
-      assert.deepEqual(parsed.custom_extra_body_param, { enabled: true })
-      assert.deepEqual(parsed.output_config, {
-        effort: "medium",
-        format: { type: "json_schema", schema: { type: "object" } },
-      })
-      assert.equal(parsed.speed, "fast")
-      assert.deepEqual(parsed.anthropic_beta, ["bedrock-beta-a"])
-    } finally {
-      if (typeof originalExtraBody === "string") {
-        process.env.CLAUDE_CODE_EXTRA_BODY = originalExtraBody
-      } else {
-        delete process.env.CLAUDE_CODE_EXTRA_BODY
-      }
-
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ type: string; text: string }>
+      messages: Array<{ content: string }>
     }
-  })
 
-  it("transformBody ignores non-object CLAUDE_CODE_EXTRA_BODY values", () => {
-    const originalExtraBody = process.env.CLAUDE_CODE_EXTRA_BODY
-
-    process.env.CLAUDE_CODE_EXTRA_BODY = JSON.stringify(["not-an-object"])
-
-    try {
-      const input = JSON.stringify({
-        messages: [{ role: "user", content: "Hello from request body" }],
-        model: "claude-opus-4-6",
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as Record<string, unknown>
-      assert.equal("anthropic_beta" in parsed, false)
-      assert.equal("custom_extra_body_param" in parsed, false)
-    } finally {
-      if (typeof originalExtraBody === "string") {
-        process.env.CLAUDE_CODE_EXTRA_BODY = originalExtraBody
-      } else {
-        delete process.env.CLAUDE_CODE_EXTRA_BODY
-      }
-    }
-  })
-
-  it("transformBody enables 1h cache TTL only for bedrock when the env gate is set", () => {
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-    const originalBedrockGate = process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK
-
-    process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK = "1"
-
-    try {
-      const input = JSON.stringify({
-        messages: [{ role: "user", content: "Hello from request body" }],
-        system: [
-          "You are Claude Code, Anthropic's official CLI for Claude.",
-          "Static preface",
-          "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__",
-          "Dynamic tail",
-        ],
-      })
-
-      process.env.ANTHROPIC_API_PROVIDER = "bedrock"
-      const bedrockOutput = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-      const bedrockParsed = JSON.parse(bedrockOutput as string) as {
-        system: Array<{
-          text: string
-          type: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.equal(
-        bedrockParsed.system[0]?.text?.startsWith("x-anthropic-billing-header:"),
-        true,
-      )
-      assert.equal(bedrockParsed.system[0]?.cache_control, undefined)
-      assert.deepEqual(bedrockParsed.system[1], {
-        type: "text",
-        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-        cache_control: { type: "ephemeral", ttl: "1h" },
-      })
-      assert.deepEqual(bedrockParsed.system[2], {
-        type: "text",
-        text: "Static preface\n\nDynamic tail",
-        cache_control: { type: "ephemeral", ttl: "1h" },
-      })
-
-      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
-      const firstPartyOutput = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-      const firstPartyParsed = JSON.parse(firstPartyOutput as string) as {
-        system: Array<{
-          text: string
-          type: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.equal(
-        firstPartyParsed.system[0]?.text?.startsWith("x-anthropic-billing-header:"),
-        true,
-      )
-      assert.equal(firstPartyParsed.system[0]?.cache_control, undefined)
-      assert.equal(firstPartyParsed.system[1]?.text, "You are Claude Code, Anthropic's official CLI for Claude.")
-      assert.equal(firstPartyParsed.system[1]?.cache_control, undefined)
-      assert.deepEqual(firstPartyParsed.system[2], {
-        type: "text",
-        text: "Static preface",
-        cache_control: { type: "ephemeral", scope: "global" },
-      })
-      assert.deepEqual(firstPartyParsed.system[3], {
-        type: "text",
-        text: "Dynamic tail",
-      })
-    } finally {
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-
-      if (typeof originalBedrockGate === "string") {
-        process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK = originalBedrockGate
-      } else {
-        delete process.env.ENABLE_PROMPT_CACHING_1H_BEDROCK
-      }
-    }
-  })
-
-  it("transformBody latches prompt-cache 1h allowlist for session stability", () => {
-    const originalAllowlist = process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST
-
-    resetPromptCache1hLatchState()
-    process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST = "repl_main_thread*"
-
-    try {
-      const input = JSON.stringify({
-        metadata: { query_source: "repl_main_thread:outputStyle:default" },
-        messages: [{ role: "user", content: "Hello from request body" }],
-        system: [
-          "You are Claude Code, Anthropic's official CLI for Claude.",
-          "Static preface",
-        ],
-      })
-
-      const firstOutput = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-      const firstParsed = JSON.parse(firstOutput as string) as {
-        system: Array<{
-          text: string
-          type: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.deepEqual(firstParsed.system[1], {
-        type: "text",
-        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-        cache_control: { type: "ephemeral", ttl: "1h" },
-      })
-      assert.deepEqual(firstParsed.system[2], {
-        type: "text",
-        text: "Static preface",
-        cache_control: { type: "ephemeral", ttl: "1h" },
-      })
-
-      process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST = "different_query_source"
-
-      const secondOutput = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-790",
-      })
-      const secondParsed = JSON.parse(secondOutput as string) as {
-        system: Array<{
-          text: string
-          type: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.deepEqual(secondParsed.system[1], {
-        type: "text",
-        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-        cache_control: { type: "ephemeral", ttl: "1h" },
-      })
-      assert.deepEqual(secondParsed.system[2], {
-        type: "text",
-        text: "Static preface",
-        cache_control: { type: "ephemeral", ttl: "1h" },
-      })
-    } finally {
-      resetPromptCache1hLatchState()
-      if (typeof originalAllowlist === "string") {
-        process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST = originalAllowlist
-      } else {
-        delete process.env.CLAUDE_CODE_PROMPT_CACHE_1H_ALLOWLIST
-      }
-    }
-  })
-
-  it("transformBody enables clear_thinking_20251015 after 1h idle for agentic query sources", () => {
-    resetThinkingClearLatchState()
-
-    try {
-      recordLastApiCompletionTimestamp(Date.now() - 61 * 60 * 1000)
-
-      const input = JSON.stringify({
-        metadata: { query_source: "repl_main_thread" },
-        model: "claude-opus-4-6",
-        messages: [{ role: "user", content: "Hello from request body" }],
-        thinking: { budget_tokens: 1024, type: "enabled" },
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as {
-        context_management: {
-          edits: Array<{
-            type: string
-            keep: "all" | { type: string; value: number }
-          }>
-        }
-      }
-
-      assert.deepEqual(parsed.context_management, {
-        edits: [
-          {
-            type: "clear_thinking_20251015",
-            keep: { type: "thinking_turns", value: 1 },
-          },
-        ],
-      })
-    } finally {
-      resetThinkingClearLatchState()
-    }
-  })
-
-  it("transformBody keeps all thinking when not in an agentic query source", () => {
-    resetThinkingClearLatchState()
-
-    try {
-      recordLastApiCompletionTimestamp(Date.now() - 61 * 60 * 1000)
-
-      const input = JSON.stringify({
-        metadata: { query_source: "side_question" },
-        model: "claude-opus-4-6",
-        messages: [{ role: "user", content: "Hello from request body" }],
-        thinking: { budget_tokens: 1024, type: "enabled" },
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as {
-        context_management: {
-          edits: Array<{
-            type: string
-            keep: "all" | { type: string; value: number }
-          }>
-        }
-      }
-
-      assert.deepEqual(parsed.context_management, {
-        edits: [
-          {
-            type: "clear_thinking_20251015",
-            keep: "all",
-          },
-        ],
-      })
-    } finally {
-      resetThinkingClearLatchState()
-    }
-  })
-
-  it("transformBody preserves core metadata identity fields over extra metadata", () => {
-    process.env.CLAUDE_CODE_EXTRA_METADATA = JSON.stringify({
-      device_id: "override-device",
-      account_uuid: "override-account",
-      session_id: "override-session",
-      workspace: "repo",
-    })
-
-    try {
-      const input = JSON.stringify({
-        messages: [{ role: "user", content: "Hello from request body" }],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as {
-        metadata: { user_id: string }
-      }
-
-      assert.deepEqual(JSON.parse(parsed.metadata.user_id), {
-        workspace: "repo",
-        device_id: "device-456",
-        account_uuid: "acct-123",
-        session_id: "session-789",
-      })
-    } finally {
-      delete process.env.CLAUDE_CODE_EXTRA_METADATA
-    }
-  })
-
-  it("computeSeededCchHash matches the recovered seeded XXH64 runtime value", () => {
-    const bodyText = '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.88.e09; cc_entrypoint=sdk-cli; cch=00000;"}]}'
-
-    assert.equal(
-      computeSeededCchHash(new TextEncoder().encode(bodyText)),
-      0xa1fb9e4e37ea9c0fn,
-    )
-    assert.equal(computeCch(bodyText), "a9c0f")
-  })
-
-  it("fillCchInSerializedBody replaces the zero slot with a deterministic 5-hex cch", () => {
-    const bodyText = '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.88.e09; cc_entrypoint=sdk-cli; cch=00000;"}]}'
-
-    assert.equal(
-      fillCchInSerializedBody(bodyText),
-      '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.88.e09; cc_entrypoint=sdk-cli; cch=a9c0f;"}]}',
+    // system[0] = billing header, system[1] = identity prefix
+    assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
+    assert.equal(parsed.system[1].text, identity)
+    // remainder is relocated to user message
+    assert.equal(parsed.system.length, 2)
+    assert.ok(
+      parsed.messages[0].content.includes("Working directory: /home/test"),
     )
   })
 
-  it("transformBody strips unsupported effort while preserving format, temperature, and empty tools", () => {
+  it("transformBody preserves identity without cache_control and relocates remainder", () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
     const input = JSON.stringify({
-      stream: true,
-      output_config: {
-        effort: "medium",
-        format: {
-          type: "json_schema",
-          schema: {
-            type: "object",
-            properties: { title: { type: "string" } },
-            required: ["title"],
-          },
+      system: [
+        {
+          type: "text",
+          text: `${identity}\nMore content here`,
+          cache_control: { type: "ephemeral", ttl: "1h" },
         },
-      },
-      temperature: 1,
-      tools: [],
-      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      ],
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string; cache_control?: unknown }>
+      messages: Array<{ content: string }>
+    }
+
+    // Identity block should NOT have cache_control
+    assert.equal(
+      parsed.system[1].cache_control,
+      undefined,
+      "Identity block must not have cache_control",
+    )
+    // Remainder is relocated to user message, not kept in system
+    assert.equal(parsed.system.length, 2)
+    assert.ok(parsed.messages[0].content.includes("More content here"))
+  })
+
+  it("transformBody does not split identity-only system entry", () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+    const input = JSON.stringify({
+      system: [{ type: "text", text: identity }],
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+    }
+
+    // system[0] = billing, system[1] = identity (not split further)
+    assert.equal(parsed.system.length, 2)
+    assert.equal(parsed.system[1].text, identity)
+  })
+
+  it("transformBody removes duplicate billing headers and relocates non-core text", () => {
+    const input = JSON.stringify({
+      system: [
+        {
+          type: "text",
+          text: "x-anthropic-billing-header: cc_version=old; cc_entrypoint=cli; cch=00000;",
+        },
+        { type: "text", text: "prompt" },
+      ],
+      messages: [{ role: "user", content: "hey" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{ content: string }>
+    }
+
+    const billingEntries = parsed.system.filter((e) =>
+      e.text.startsWith("x-anthropic-billing-header:"),
+    )
+    assert.equal(
+      billingEntries.length,
+      1,
+      "Should have exactly one billing header",
+    )
+    assert.ok(
+      billingEntries[0].text.includes("cch=25d84"),
+      `Expected computed cch, got: ${billingEntries[0].text}`,
+    )
+    // "prompt" should be relocated to user message
+    assert.ok(parsed.messages[0].content.includes("prompt"))
+  })
+
+  it("transformBody relocates multiple non-core system entries to user message as content blocks", () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+    const input = JSON.stringify({
+      system: [
+        { type: "text", text: identity },
+        { type: "text", text: "Custom instructions block A" },
+        { type: "text", text: "Custom instructions block B" },
+      ],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "hello" }],
+        },
+      ],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{
+        content: Array<{ type: string; text: string }>
+      }>
+    }
+
+    // system should only have billing header + identity
+    assert.equal(parsed.system.length, 2)
+    assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
+    assert.equal(parsed.system[1].text, identity)
+    // Both custom blocks should be prepended to user message content
+    assert.equal(parsed.messages[0].content[0].type, "text")
+    assert.ok(
+      parsed.messages[0].content[0].text.includes(
+        "Custom instructions block A",
+      ),
+    )
+    assert.ok(
+      parsed.messages[0].content[0].text.includes(
+        "Custom instructions block B",
+      ),
+    )
+    // Original user content preserved
+    assert.equal(parsed.messages[0].content[1].text, "hello")
+  })
+
+  it("transformBody keeps system intact when no messages exist", () => {
+    const input = JSON.stringify({
+      system: [{ type: "text", text: "Some instructions" }],
+      messages: [],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+    }
+
+    // With no messages to relocate into, system stays as-is
+    // (billing header + original text)
+    assert.ok(parsed.system.length >= 2)
+  })
+
+  it("transformBody strips output_config.effort for haiku", () => {
+    const input = JSON.stringify({
       model: "claude-haiku-4-5-20251001",
+      output_config: { effort: "high" },
+      messages: [{ role: "user", content: "test" }],
     })
 
-    const output = transformBody(input, {
-      accountUuid: "acct-123",
-      cliVersion: "2.1.88",
-      deviceId: "device-456",
-      sessionId: "session-789",
-    })
-
-    assert.equal(typeof output, "string")
+    const output = transformBody(input)
     const parsed = JSON.parse(output as string) as {
-      output_config: { format: { type: string }; effort?: string }
-      temperature: number
-      tools: unknown[]
+      output_config?: Record<string, unknown>
     }
 
-    assert.equal(parsed.temperature, 1)
-    assert.deepEqual(parsed.tools, [])
-    assert.equal(parsed.output_config.effort, undefined)
-    assert.equal(parsed.output_config.format.type, "json_schema")
-    assert.deepEqual(Object.keys(parsed), [
-      "model",
-      "messages",
-      "system",
-      "tools",
-      "metadata",
-      "temperature",
-      "output_config",
-      "stream",
-    ])
-  })
-
-  it("transformBody adds official-style cache markers to the last system and message blocks", () => {
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-
-    try {
-      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
-
-    const input = JSON.stringify({
-      metadata: {
-        query_source: "repl_main_thread",
-      },
-      system: [{ type: "text", text: "Existing system" }],
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Earlier content" },
-            {
-              type: "tool_result",
-              tool_use_id: "tool-1",
-              content: [{ type: "text", text: "tool result" }],
-            },
-          ],
-        },
-        {
-          role: "user",
-          content: [{ type: "text", text: "Last user marker block" }],
-        },
-      ],
-    })
-
-    const output = transformBody(input, {
-      accountUuid: "acct-123",
-      cliVersion: "2.1.88",
-      deviceId: "device-456",
-      sessionId: "session-789",
-    })
-
-    assert.equal(typeof output, "string")
-    const parsed = JSON.parse(output as string) as {
-      system: Array<{
-        type: string
-        text: string
-        cache_control?: { type: string; scope?: string; ttl?: string }
-      }>
-      messages: Array<{
-        role: string
-        content: Array<{
-          type: string
-          text?: string
-          tool_use_id?: string
-          cache_reference?: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }>
-    }
-
-    assert.deepEqual(parsed.system[1], {
-      type: "text",
-      text: "Existing system",
-      cache_control: { type: "ephemeral" },
-    })
     assert.equal(
-      parsed.messages[0]?.content[1]?.cache_reference,
-      parsed.messages[0]?.content[1]?.tool_use_id,
+      parsed.output_config,
+      undefined,
+      "output_config should be removed when effort was its only field",
     )
-    assert.deepEqual(parsed.messages[1]?.content[0]?.cache_control, {
-      type: "ephemeral",
-    })
-    } finally {
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-    }
   })
 
-  it("transformBody uses metadata cache edit block and skip-global system cache options", () => {
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-
-    try {
-      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
-
-      const input = JSON.stringify({
-        metadata: {
-          cache_edit_block: {
-            type: "cache_edits",
-            edits: [{ old_text: "foo", new_text: "bar" }],
-          },
-          query_source: "repl_main_thread",
-          skip_global_cache_for_system_prompt: true,
-        },
-        system: [
-          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
-          { type: "text", text: "Existing system" },
-        ],
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "r1" }] },
-              { type: "text", text: "tail-1" },
-            ],
-          },
-        ],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as {
-        system: Array<{
-          type: string
-          text: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-        messages: Array<{
-          role: string
-          content: Array<{
-            type: string
-            text?: string
-            tool_use_id?: string
-            cache_reference?: string
-            edits?: Array<{ old_text: string; new_text: string }>
-          }>
-        }>
-      }
-
-      assert.deepEqual(parsed.system[1], {
-        type: "text",
-        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-        cache_control: { type: "ephemeral" },
-      })
-      assert.deepEqual(parsed.system[2], {
-        type: "text",
-        text: "Existing system",
-        cache_control: { type: "ephemeral" },
-      })
-      assert.equal(parsed.messages[0]?.content[1]?.type, "cache_edits")
-      assert.deepEqual(parsed.messages[0]?.content[1]?.edits, [
-        { old_text: "foo", new_text: "bar" },
-      ])
-      assert.equal(parsed.messages[0]?.content[0]?.cache_reference, undefined)
-    } finally {
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-    }
-  })
-
-  it("transformBody only uses global system cache scope for first-party provider", () => {
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-    const originalDisableBetas = process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-
-    try {
-      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
-      delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-
-      const firstPartyInput = JSON.stringify({
-        system: [
-          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
-          { type: "text", text: "Static preface" },
-          { type: "text", text: "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__" },
-          { type: "text", text: "Dynamic tail" },
-        ],
-        messages: [{ role: "user", content: "Hello from request body" }],
-      })
-
-      const firstPartyOutput = transformBody(firstPartyInput, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      const firstPartyParsed = JSON.parse(firstPartyOutput as string) as {
-        system: Array<{
-          type: string
-          text: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.deepEqual(firstPartyParsed.system[2], {
-        type: "text",
-        text: "Static preface",
-        cache_control: { type: "ephemeral", scope: "global" },
-      })
-      assert.deepEqual(firstPartyParsed.system[3], {
-        type: "text",
-        text: "Dynamic tail",
-      })
-
-      process.env.ANTHROPIC_API_PROVIDER = "bedrock"
-
-      const thirdPartyOutput = transformBody(firstPartyInput, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      const thirdPartyParsed = JSON.parse(thirdPartyOutput as string) as {
-        system: Array<{
-          type: string
-          text: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.deepEqual(thirdPartyParsed.system[1], {
-        type: "text",
-        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-        cache_control: { type: "ephemeral" },
-      })
-      assert.deepEqual(thirdPartyParsed.system[2], {
-        type: "text",
-        text: "Static preface\n\nDynamic tail",
-        cache_control: { type: "ephemeral" },
-      })
-    } finally {
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-
-      if (typeof originalDisableBetas === "string") {
-        process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS = originalDisableBetas
-      } else {
-        delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-      }
-    }
-  })
-
-  it("transformBody disables global system cache when a rendered MCP tool is present", () => {
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-    const originalDisableBetas = process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-
-    try {
-      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
-      delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-
-      const input = JSON.stringify({
-        system: [
-          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
-          { type: "text", text: "Static preface" },
-          { type: "text", text: "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__" },
-          { type: "text", text: "Dynamic tail" },
-        ],
-        tools: [
-          { name: "mcp_search", isMcp: true },
-        ],
-        messages: [{ role: "user", content: "Hello from request body" }],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      const parsed = JSON.parse(output as string) as {
-        system: Array<{
-          type: string
-          text: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.deepEqual(parsed.system[1], {
-        type: "text",
-        text: "You are Claude Code, Anthropic's official CLI for Claude.",
-        cache_control: { type: "ephemeral" },
-      })
-      assert.deepEqual(parsed.system[2], {
-        type: "text",
-        text: "Static preface\n\nDynamic tail",
-        cache_control: { type: "ephemeral" },
-      })
-    } finally {
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-
-      if (typeof originalDisableBetas === "string") {
-        process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS = originalDisableBetas
-      } else {
-        delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-      }
-    }
-  })
-
-  it("transformBody keeps global system cache when MCP tools are deferred", () => {
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-    const originalDisableBetas = process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-
-    try {
-      process.env.ANTHROPIC_API_PROVIDER = "firstParty"
-      delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-
-      const input = JSON.stringify({
-        system: [
-          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
-          { type: "text", text: "Static preface" },
-          { type: "text", text: "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__" },
-          { type: "text", text: "Dynamic tail" },
-        ],
-        tools: [
-          { name: "mcp_search", isMcp: true, defer_loading: true },
-        ],
-        messages: [{ role: "user", content: "Hello from request body" }],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      const parsed = JSON.parse(output as string) as {
-        system: Array<{
-          type: string
-          text: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
-      }
-
-      assert.deepEqual(parsed.system[2], {
-        type: "text",
-        text: "Static preface",
-        cache_control: { type: "ephemeral", scope: "global" },
-      })
-      assert.deepEqual(parsed.system[3], {
-        type: "text",
-        text: "Dynamic tail",
-      })
-    } finally {
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-
-      if (typeof originalDisableBetas === "string") {
-        process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS = originalDisableBetas
-      } else {
-        delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
-      }
-    }
-  })
-
-  it("transformBody inserts pinned and new cache edits after tool results", () => {
-    const originalCacheEdit = process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-    resetMicrocompactState()
-    process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK = JSON.stringify({
-      type: "cache_edits",
-      edits: [{ old_text: "foo", new_text: "bar" }],
-    })
-    process.env.ANTHROPIC_API_PROVIDER = "firstParty"
-
-    try {
-      const input = JSON.stringify({
-        metadata: {
-          query_source: "repl_main_thread",
-          pinned_cache_edits: [
-            {
-              userMessageIndex: 0,
-              block: {
-                type: "cache_edits",
-                edits: [{ old_text: "old", new_text: "new" }],
-              },
-            },
-          ],
-        },
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "r1" }] },
-              { type: "text", text: "tail-1" },
-            ],
-          },
-          {
-            role: "user",
-            content: [
-              { type: "tool_result", tool_use_id: "tool-2", content: [{ type: "text", text: "r2" }] },
-              { type: "text", text: "tail-2" },
-            ],
-          },
-        ],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as {
-        messages: Array<{
-          content: Array<{
-            type: string
-            text?: string
-            tool_use_id?: string
-            edits?: Array<{ old_text: string; new_text: string }>
-            cache_control?: { type: string; scope?: string; ttl?: string }
-          }>
-        }>
-      }
-
-      assert.equal(parsed.messages[0]?.content[1]?.type, "cache_edits")
-      assert.deepEqual(parsed.messages[0]?.content[1]?.edits, [
-        { old_text: "old", new_text: "new" },
-      ])
-      assert.equal(parsed.messages[0]?.content[2]?.type, "text")
-
-      assert.equal(parsed.messages[1]?.content[1]?.type, "cache_edits")
-      assert.deepEqual(parsed.messages[1]?.content[1]?.edits, [
-        { old_text: "foo", new_text: "bar" },
-      ])
-      assert.equal(parsed.messages[1]?.content[2]?.type, "text")
-    } finally {
-      resetMicrocompactState()
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-      if (typeof originalCacheEdit === "string") {
-        process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK = originalCacheEdit
-      } else {
-        delete process.env.CLAUDE_CODE_CACHE_EDIT_BLOCK
-      }
-    }
-  })
-
-  it("transformBody does not insert cache edits outside official cached-MC conditions", () => {
-    const originalProvider = process.env.ANTHROPIC_API_PROVIDER
-    resetMicrocompactState()
-
-    try {
-      process.env.ANTHROPIC_API_PROVIDER = "bedrock"
-
-      const input = JSON.stringify({
-        metadata: {
-          query_source: "repl_main_thread",
-          cache_edit_block: {
-            type: "cache_edits",
-            edits: [{ old_text: "foo", new_text: "bar" }],
-          },
-          pinned_cache_edits: [
-            {
-              userMessageIndex: 0,
-              block: {
-                type: "cache_edits",
-                edits: [{ old_text: "old", new_text: "new" }],
-              },
-            },
-          ],
-        },
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "r1" }] },
-              { type: "text", text: "tail-1" },
-            ],
-          },
-        ],
-      })
-
-      const output = transformBody(input, {
-        accountUuid: "acct-123",
-        cliVersion: "2.1.88",
-        deviceId: "device-456",
-        sessionId: "session-789",
-      })
-
-      assert.equal(typeof output, "string")
-      const parsed = JSON.parse(output as string) as {
-        messages: Array<{
-          content: Array<{
-            type: string
-            text?: string
-            tool_use_id?: string
-            cache_reference?: string
-            edits?: Array<{ old_text: string; new_text: string }>
-          }>
-        }>
-      }
-
-      assert.equal(parsed.messages[0]?.content.length, 2)
-      assert.equal(parsed.messages[0]?.content[0]?.type, "tool_result")
-      assert.equal(parsed.messages[0]?.content[0]?.cache_reference, undefined)
-      assert.equal(parsed.messages[0]?.content[1]?.type, "text")
-    } finally {
-      resetMicrocompactState()
-      if (typeof originalProvider === "string") {
-        process.env.ANTHROPIC_API_PROVIDER = originalProvider
-      } else {
-        delete process.env.ANTHROPIC_API_PROVIDER
-      }
-    }
-  })
-
-  it("transformBody does not cache-mark assistant thinking blocks", () => {
+  it("transformBody strips effort but keeps other output_config fields for haiku", () => {
     const input = JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      output_config: { effort: "high", max_tokens: 1024 },
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      output_config?: { effort?: string; max_tokens?: number }
+    }
+
+    assert.ok(
+      parsed.output_config,
+      "output_config should be preserved when other fields exist",
+    )
+    assert.equal(parsed.output_config!.max_tokens, 1024)
+    assert.equal(
+      parsed.output_config!.effort,
+      undefined,
+      "effort should be stripped",
+    )
+  })
+
+  it("transformBody strips thinking.effort but preserves other fields for haiku", () => {
+    const input = JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      thinking: { type: "enabled", effort: "high" },
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      thinking?: Record<string, unknown>
+    }
+
+    assert.ok(
+      parsed.thinking,
+      "thinking should be preserved when non-effort fields remain",
+    )
+    assert.equal(
+      parsed.thinking!.effort,
+      undefined,
+      "effort should be stripped",
+    )
+    assert.equal(parsed.thinking!.type, "enabled", "type should be preserved")
+  })
+
+  it("transformBody removes thinking entirely when effort is its only field for haiku", () => {
+    const input = JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      thinking: { effort: "high" },
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      thinking?: Record<string, unknown>
+    }
+
+    assert.equal(
+      parsed.thinking,
+      undefined,
+      "thinking should be removed when effort was its only field",
+    )
+  })
+
+  it("transformBody preserves thinking for haiku when effort is absent", () => {
+    const input = JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      thinking?: Record<string, unknown>
+    }
+
+    assert.deepEqual(
+      parsed.thinking,
+      { type: "enabled" },
+      "thinking without effort should pass through unchanged",
+    )
+  })
+
+  it("transformBody preserves effort for non-haiku models", () => {
+    const input = JSON.stringify({
+      model: "claude-opus-4-6",
+      output_config: { effort: "high" },
+      thinking: { type: "enabled", effort: "high" },
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      output_config?: { effort?: string }
+      thinking?: { effort?: string }
+    }
+
+    assert.equal(
+      parsed.output_config!.effort,
+      "high",
+      "output_config.effort should remain for opus",
+    )
+    assert.equal(
+      parsed.thinking!.effort,
+      "high",
+      "thinking.effort should remain for opus",
+    )
+  })
+
+  it("transformBody handles haiku without effort-related fields", () => {
+    const input = JSON.stringify({
+      model: "claude-haiku-4-5",
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      output_config?: unknown
+      thinking?: unknown
+    }
+
+    assert.equal(parsed.output_config, undefined)
+    assert.equal(parsed.thinking, undefined)
+  })
+
+  it("transformBody PascalCase-prefixes tool names with mcp_", () => {
+    const input = JSON.stringify({
+      system: [],
+      tools: [
+        { name: "bash" },
+        { name: "read" },
+        { name: "background_output" },
+      ],
       messages: [
         {
-          role: "assistant",
+          role: "user",
           content: [
-            { type: "text", text: "prefix" },
-            { type: "thinking", thinking: "secret" },
+            { type: "tool_use", name: "bash" },
+            { type: "tool_use", name: "background_output" },
           ],
         },
       ],
     })
 
-    const output = transformBody(input, {
-      accountUuid: "acct-123",
-      cliVersion: "2.1.88",
-      deviceId: "device-456",
-      sessionId: "session-789",
-    })
-
-    assert.equal(typeof output, "string")
+    const output = transformBody(input)
     const parsed = JSON.parse(output as string) as {
+      tools: Array<{ name: string }>
       messages: Array<{
-        content: Array<{
-          type: string
-          text?: string
-          thinking?: string
-          cache_control?: { type: string; scope?: string; ttl?: string }
-        }>
+        content: Array<{ type: string; name?: string }>
       }>
     }
 
-    assert.equal(parsed.messages[0]?.content[1]?.type, "thinking")
-    assert.equal(parsed.messages[0]?.content[1]?.cache_control, undefined)
-    assert.deepEqual(parsed.messages[0]?.content[0]?.cache_control, {
-      type: "ephemeral",
-    })
+    assert.equal(parsed.tools[0].name, "mcp_Bash")
+    assert.equal(parsed.tools[1].name, "mcp_Read")
+    assert.equal(parsed.tools[2].name, "mcp_Background_output")
+    assert.equal(parsed.messages[0].content[0].name, "mcp_Bash")
+    assert.equal(parsed.messages[0].content[1].name, "mcp_Background_output")
+  })
+
+  it("stripToolPrefix reverses PascalCase mcp_ prefix", () => {
+    assert.equal(stripToolPrefix('{"name": "mcp_Bash"}'), '{"name": "bash"}')
+    assert.equal(
+      stripToolPrefix('{"name": "mcp_Background_output"}'),
+      '{"name": "background_output"}',
+    )
   })
 
   it("stripToolPrefix removes mcp_ from response payload names", () => {
     const input = '{"name":"mcp_search","type":"tool_use"}'
     assert.equal(stripToolPrefix(input), '{"name": "search","type":"tool_use"}')
+  })
+
+  it("transformResponseStream passes error responses through without SSE parsing", async () => {
+    const errorBody = JSON.stringify({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: "Test error message",
+      },
+    })
+    const response = new Response(errorBody, {
+      status: 400,
+      statusText: "Bad Request",
+      headers: { "content-type": "application/json" },
+    })
+
+    const transformed = transformResponseStream(response)
+    assert.equal(transformed.status, 400)
+    assert.equal(transformed.statusText, "Bad Request")
+
+    const text = await transformed.text()
+    assert.equal(text, errorBody, "Error body should pass through unchanged")
+  })
+
+  it("transformResponseStream passes 401 errors through intact", async () => {
+    const errorBody = JSON.stringify({
+      type: "error",
+      error: {
+        type: "authentication_error",
+        message: "OAuth token has expired.",
+      },
+    })
+    const response = new Response(errorBody, { status: 401 })
+    const transformed = transformResponseStream(response)
+    assert.equal(transformed.status, 401)
+    const text = await transformed.text()
+    const parsed = JSON.parse(text) as { error: { message: string } }
+    assert.equal(parsed.error.message, "OAuth token has expired.")
+  })
+
+  it("transformResponseStream passes 429 errors through intact", async () => {
+    const errorBody = JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "Rate limited" },
+    })
+    const response = new Response(errorBody, {
+      status: 429,
+      headers: { "retry-after": "30" },
+    })
+    const transformed = transformResponseStream(response)
+    assert.equal(transformed.status, 429)
+    assert.equal(transformed.headers.get("retry-after"), "30")
+    const text = await transformed.text()
+    assert.ok(text.includes("Rate limited"))
+  })
+
+  it("transformResponseStream passes 529 overloaded errors through", async () => {
+    const response = new Response("Overloaded", { status: 529 })
+    const transformed = transformResponseStream(response)
+    assert.equal(transformed.status, 529)
+    const text = await transformed.text()
+    assert.equal(text, "Overloaded")
+  })
+
+  it("transformResponseStream still strips tool prefixes in error bodies", async () => {
+    // stripToolPrefix matches the pattern "name": "mcp_..."
+    const errorBody = '{"name": "mcp_search", "error": "failed"}'
+    const response = new Response(errorBody, { status: 400 })
+    const transformed = transformResponseStream(response)
+    const text = await transformed.text()
+    assert.ok(
+      text.includes('"name": "search"'),
+      "Should strip mcp_ prefix even in error bodies",
+    )
+    assert.ok(
+      !text.includes("mcp_search"),
+      "Should not contain mcp_search after stripping",
+    )
   })
 
   it("transformResponseStream rewrites streamed tool names", async () => {
@@ -1455,6 +657,168 @@ describe("transforms", () => {
 
     const final = await reader.read()
     assert.equal(final.done, true)
+  })
+
+  describe("repairToolPairs", () => {
+    it("removes tool_use blocks with no matching tool_result", () => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_orphan", name: "search" }],
+        },
+        {
+          role: "user",
+          content: [{ type: "text", text: "no tool_result here" }],
+        },
+      ]
+      const result = repairToolPairs(messages)
+      // The assistant message with only the orphaned tool_use should be removed
+      assert.equal(result.length, 1)
+      assert.equal(result[0].role, "user")
+    })
+
+    it("removes tool_result blocks with no matching tool_use", () => {
+      const messages = [
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_orphan", content: "ok" },
+          ],
+        },
+      ]
+      const result = repairToolPairs(messages)
+      // The user message with only the orphaned tool_result should be removed
+      assert.equal(result.length, 0)
+    })
+
+    it("preserves text blocks when removing orphaned tool_use", () => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I will search for that." },
+            { type: "tool_use", id: "toolu_orphan", name: "search" },
+          ],
+        },
+      ]
+      const result = repairToolPairs(messages)
+      assert.equal(result.length, 1)
+      assert.deepEqual(result[0].content, [
+        { type: "text", text: "I will search for that." },
+      ])
+    })
+
+    it("does not modify valid tool_use/tool_result pairs", () => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_valid", name: "search" }],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_valid", content: "ok" },
+          ],
+        },
+      ]
+      const result = repairToolPairs(messages)
+      assert.equal(result.length, 2)
+      assert.deepEqual(result, messages)
+    })
+
+    it("passes through messages with no tool blocks", () => {
+      const messages = [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content: [{ type: "text", text: "world" }] },
+      ]
+      const result = repairToolPairs(messages)
+      assert.deepEqual(result, messages)
+    })
+
+    it("handles mix of valid and orphaned tool blocks", () => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_valid", name: "search" },
+            { type: "tool_use", id: "toolu_orphan", name: "lookup" },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_valid", content: "ok" },
+          ],
+        },
+      ]
+      const result = repairToolPairs(messages)
+      assert.equal(result.length, 2)
+      // Only the valid tool_use remains
+      assert.deepEqual(result[0].content, [
+        { type: "tool_use", id: "toolu_valid", name: "search" },
+      ])
+      // tool_result for valid stays
+      assert.deepEqual(result[1].content, [
+        { type: "tool_result", tool_use_id: "toolu_valid", content: "ok" },
+      ])
+    })
+
+    it("preserves messages with string content", () => {
+      const messages = [
+        { role: "user", content: "just a string" },
+        { role: "assistant", content: "response string" },
+      ]
+      const result = repairToolPairs(messages)
+      assert.deepEqual(result, messages)
+    })
+
+    it("handles multiple valid pairs", () => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_a", name: "search" },
+            { type: "tool_use", id: "toolu_b", name: "read" },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_a", content: "res_a" },
+            { type: "tool_result", tool_use_id: "toolu_b", content: "res_b" },
+          ],
+        },
+      ]
+      const result = repairToolPairs(messages)
+      assert.deepEqual(result, messages)
+    })
+  })
+
+  it("transformBody removes orphaned tool_use blocks from messages", () => {
+    const input = JSON.stringify({
+      system: [{ type: "text", text: "prompt" }],
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_orphan", name: "search" }],
+        },
+        { role: "user", content: "hello" },
+      ],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      messages: Array<{ role: string; content: unknown }>
+    }
+
+    // Orphaned tool_use message should be removed.
+    // The user message remains, with the relocated system "prompt" prepended.
+    assert.equal(parsed.messages.length, 1)
+    assert.equal(parsed.messages[0].role, "user")
+    assert.ok(
+      (parsed.messages[0].content as string).includes("hello"),
+      "User message content should be preserved",
+    )
   })
 
   it("transformResponseStream flushes remaining buffered data on stream end", async () => {

@@ -39,14 +39,65 @@ describe("betas", () => {
     }
   })
 
-  it("getModelBetas includes all baseBetas for haiku", () => {
+  it("getModelBetas includes non-excluded baseBetas for haiku", () => {
     const haikuBetas = getModelBetas("claude-haiku-4-5")
+    const override = getModelOverride("claude-haiku-4-5")
     for (const beta of config.baseBetas) {
-      const override = getModelOverride("claude-haiku-4-5")
-      if (override?.exclude?.includes(beta)) continue
+      if (override?.exclude?.includes(beta)) {
+        assert.ok(
+          !haikuBetas.includes(beta),
+          `haiku should exclude overridden beta: ${beta}`,
+        )
+      } else {
+        assert.ok(
+          haikuBetas.includes(beta),
+          `haiku should include base beta: ${beta}`,
+        )
+      }
+    }
+  })
+
+  it("getModelBetas excludes interleaved-thinking for haiku models", () => {
+    const models = ["claude-haiku-4-5", "claude-haiku-4-5-20251001"]
+    for (const model of models) {
+      const betas = getModelBetas(model)
       assert.ok(
-        haikuBetas.includes(beta),
-        `haiku should include base beta: ${beta}`,
+        !betas.includes("interleaved-thinking-2025-05-14"),
+        `${model} should not include interleaved-thinking beta`,
+      )
+      assert.ok(
+        betas.includes("claude-code-20250219"),
+        `${model} should still include claude-code beta`,
+      )
+      assert.ok(
+        betas.includes("oauth-2025-04-20"),
+        `${model} should still include oauth beta`,
+      )
+    }
+  })
+
+  it("getModelOverride sets disableEffort for haiku models", () => {
+    for (const model of ["claude-haiku-4-5", "claude-haiku-4-5-20251001"]) {
+      const override = getModelOverride(model)
+      assert.ok(override, `${model} should have a model override`)
+      assert.equal(
+        override!.disableEffort,
+        true,
+        `${model} should have disableEffort set`,
+      )
+    }
+  })
+
+  it("getModelOverride does not set disableEffort for non-haiku models", () => {
+    for (const model of [
+      "claude-sonnet-4-6",
+      "claude-opus-4-6",
+      "claude-opus-4-7",
+    ]) {
+      const override = getModelOverride(model)
+      assert.ok(
+        !override?.disableEffort,
+        `${model} should not have disableEffort`,
       )
     }
   })
@@ -76,6 +127,7 @@ describe("betas", () => {
       const models = [
         "claude-sonnet-4-6",
         "claude-opus-4-6",
+        "claude-opus-4-7",
         "claude-sonnet-4-5-20250514",
         "claude-opus-4-5-20250514",
         "claude-opus-4-20250514",
@@ -107,6 +159,12 @@ describe("betas", () => {
       assert.ok(
         opus.includes("context-1m-2025-08-07"),
         "opus 4.6 should get 1M beta when opted in",
+      )
+
+      const opus47 = getModelBetas("claude-opus-4-7")
+      assert.ok(
+        opus47.includes("context-1m-2025-08-07"),
+        "opus 4.7 should get 1M beta when opted in",
       )
     } finally {
       delete process.env.ANTHROPIC_ENABLE_1M_CONTEXT
@@ -141,6 +199,7 @@ describe("betas", () => {
   it("supports1mContext identifies eligible models", () => {
     assert.ok(supports1mContext("claude-sonnet-4-6"), "sonnet 4.6 supports 1M")
     assert.ok(supports1mContext("claude-opus-4-6"), "opus 4.6 supports 1M")
+    assert.ok(supports1mContext("claude-opus-4-7"), "opus 4.7 supports 1M")
     assert.ok(
       !supports1mContext("claude-sonnet-4-5-20250514"),
       "sonnet 4.5 does not support 1M",
@@ -157,7 +216,7 @@ describe("betas", () => {
   })
 
   it("supportsEffort matches the official allowlist we model locally", () => {
-    assert.equal(supportsEffort("claude-opus-4-5-20251001"), true)
+    assert.equal(supportsEffort("claude-opus-4-5-20251001"), false)
     assert.equal(supportsEffort("claude-sonnet-4-6"), true)
     assert.equal(supportsEffort("claude-haiku-4-5-20251001"), false)
     assert.equal(supportsEffort("claude-sonnet-4-5-20250929"), false)

@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process"
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { execFileSync, execSync } from "node:child_process"
+import { chmodSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { log } from "./logger.ts"
@@ -8,9 +8,7 @@ export interface ClaudeCredentials {
   accessToken: string
   refreshToken: string
   expiresAt: number
-  accountUuid?: string
   subscriptionType?: string
-  userID?: string
 }
 
 export interface ClaudeAccount {
@@ -19,28 +17,7 @@ export interface ClaudeAccount {
   credentials: ClaudeCredentials
 }
 
-export interface ClaudeStateIdentity {
-  accountUuid?: string
-  userID?: string
-}
-
 const PRIMARY_SERVICE = "Claude Code-credentials"
-
-type JsonObject = Record<string, unknown>
-
-function isJsonObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function getOptionalString(...values: unknown[]): string | undefined {
-  for (const value of values) {
-    if (typeof value === "string") {
-      return value
-    }
-  }
-
-  return undefined
-}
 
 function parseCredentials(raw: string): ClaudeCredentials | null {
   let parsed: unknown
@@ -50,17 +27,17 @@ function parseCredentials(raw: string): ClaudeCredentials | null {
     return null
   }
 
-  if (!isJsonObject(parsed)) {
-    return null
+  const data = (parsed as { claudeAiOauth?: unknown }).claudeAiOauth ?? parsed
+  const creds = data as {
+    accessToken?: unknown
+    refreshToken?: unknown
+    expiresAt?: unknown
+    subscriptionType?: unknown
+    mcpOAuth?: unknown
   }
 
-  const data = isJsonObject(parsed.claudeAiOauth)
-    ? parsed.claudeAiOauth
-    : parsed
-  const creds = data
-
   // Entries that only contain mcpOAuth are MCP server credentials, not user accounts
-  if (isJsonObject(parsed.mcpOAuth) && typeof creds.accessToken !== "string") {
+  if ((parsed as { mcpOAuth?: unknown }).mcpOAuth && !creds.accessToken) {
     return null
   }
 
@@ -89,89 +66,11 @@ function parseCredentials(raw: string): ClaudeCredentials | null {
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
-    accountUuid: getOptionalString(creds.accountUuid, parsed.accountUuid),
     subscriptionType:
       typeof creds.subscriptionType === "string"
         ? creds.subscriptionType
         : undefined,
-    userID: getOptionalString(creds.userID, parsed.userID),
   }
-}
-
-function parseClaudeStateIdentity(raw: string): ClaudeStateIdentity | null {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return null
-  }
-
-  if (!isJsonObject(parsed)) {
-    return null
-  }
-
-  const oauthAccount = isJsonObject(parsed.oauthAccount)
-    ? parsed.oauthAccount
-    : undefined
-  const identity = {
-    accountUuid: getOptionalString(
-      oauthAccount?.accountUuid,
-      parsed.accountUuid,
-    ),
-    userID: getOptionalString(parsed.userID),
-  }
-
-  if (!identity.accountUuid && !identity.userID) {
-    return null
-  }
-
-  return identity
-}
-
-function readClaudeStateFile(path: string): ClaudeStateIdentity | null {
-  try {
-    return parseClaudeStateIdentity(readFileSync(path, "utf-8"))
-  } catch {
-    return null
-  }
-}
-
-function getClaudeStateBackupPaths(): string[] {
-  const backupDir = join(homedir(), ".claude", "backups")
-  if (!existsSync(backupDir)) {
-    return []
-  }
-
-  return readdirSync(backupDir)
-    .filter((name) => name.startsWith(".claude.json.backup."))
-    .sort((left, right) => {
-      const leftTs = Number(left.slice(".claude.json.backup.".length))
-      const rightTs = Number(right.slice(".claude.json.backup.".length))
-
-      if (Number.isFinite(leftTs) && Number.isFinite(rightTs)) {
-        return rightTs - leftTs
-      }
-
-      return right.localeCompare(left)
-    })
-    .map((name) => join(backupDir, name))
-}
-
-export function readClaudeStateIdentity(): ClaudeStateIdentity | null {
-  const primaryPath = join(homedir(), ".claude", ".claude.json")
-  const primaryIdentity = readClaudeStateFile(primaryPath)
-  if (primaryIdentity) {
-    return primaryIdentity
-  }
-
-  for (const backupPath of getClaudeStateBackupPaths()) {
-    const backupIdentity = readClaudeStateFile(backupPath)
-    if (backupIdentity) {
-      return backupIdentity
-    }
-  }
-
-  return null
 }
 
 function readKeychainService(serviceName: string): string | null {
@@ -335,6 +234,111 @@ export function readAllClaudeAccounts(): ClaudeAccount[] {
     source: a.source,
     credentials: a.credentials,
   }))
+}
+
+export function updateCredentialBlob(
+  existingJson: string,
+  newCreds: { accessToken: string; refreshToken: string; expiresAt: number },
+): string | null {
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(existingJson)
+  } catch {
+    return null
+  }
+
+  const wrapper = parsed.claudeAiOauth as Record<string, unknown> | undefined
+  const target = wrapper ?? parsed
+
+  target.accessToken = newCreds.accessToken
+  target.refreshToken = newCreds.refreshToken
+  target.expiresAt = newCreds.expiresAt
+
+  return JSON.stringify(parsed)
+}
+
+function getKeychainAccountName(serviceName: string): string | null {
+  try {
+    const output = execFileSync(
+      "/usr/bin/security",
+      ["find-generic-password", "-s", serviceName],
+      { timeout: 2000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+    )
+    const match = /"acct"<blob>="([^"]*)"/.exec(output)
+    if (match) {
+      log("keychain_account_name", {
+        service: serviceName,
+        account: match[1],
+      })
+      return match[1]
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+export function writeBackCredentials(
+  source: string,
+  creds: ClaudeCredentials,
+): boolean {
+  const newCreds = {
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  }
+
+  if (source === "file") {
+    try {
+      const credPath = join(homedir(), ".claude", ".credentials.json")
+      const raw = readFileSync(credPath, "utf-8")
+      const updated = updateCredentialBlob(raw, newCreds)
+      if (!updated) return false
+      writeFileSync(credPath, updated, { encoding: "utf-8", mode: 0o600 })
+      if (process.platform !== "win32") {
+        chmodSync(credPath, 0o600)
+      }
+      log("writeback_success", { source })
+      return true
+    } catch {
+      log("writeback_failed", { source })
+      return false
+    }
+  }
+
+  if (process.platform === "darwin") {
+    try {
+      const raw = readKeychainService(source)
+      if (!raw) return false
+      const updated = updateCredentialBlob(raw, newCreds)
+      if (!updated) return false
+      // Discover the actual account name from the existing Keychain entry.
+      // Claude CLI uses the macOS username (e.g. "gmartin"), not the service name.
+      // Using the wrong account name creates a duplicate entry instead of updating.
+      const accountName = getKeychainAccountName(source) ?? source
+      execFileSync(
+        "/usr/bin/security",
+        [
+          "add-generic-password",
+          "-s",
+          source,
+          "-a",
+          accountName,
+          "-w",
+          updated,
+          "-U",
+        ],
+        { timeout: 2000, stdio: "ignore" },
+      )
+      log("writeback_success", { source, accountName })
+      return true
+    } catch {
+      log("writeback_failed", { source })
+      return false
+    }
+  }
+
+  return false
 }
 
 export function refreshAccount(source: string): ClaudeCredentials | null {
