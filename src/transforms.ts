@@ -32,6 +32,78 @@ type Message = {
   content?: string | ContentBlock[]
 }
 
+export interface TransformIdentitySeed {
+  deviceId: string
+  accountUuid: string
+  sessionId: string
+}
+
+export interface TransformBodyOptions {
+  anonymizeIdentity?: boolean
+  identitySeed?: TransformIdentitySeed
+}
+
+function ensureMetadataUserId(
+  parsed: Record<string, unknown>,
+  identitySeed?: TransformIdentitySeed,
+): void {
+  if (!identitySeed) {
+    return
+  }
+
+  if (!parsed.metadata || typeof parsed.metadata !== "object") {
+    parsed.metadata = {}
+  }
+
+  const metadataRecord = parsed.metadata as Record<string, unknown>
+  let existing: Record<string, unknown> = {}
+  if (typeof metadataRecord.user_id === "string") {
+    try {
+      existing = JSON.parse(metadataRecord.user_id) as Record<string, unknown>
+    } catch {
+      existing = {}
+    }
+  }
+
+  metadataRecord.user_id = JSON.stringify({
+    ...existing,
+    device_id: identitySeed.deviceId,
+    account_uuid: identitySeed.accountUuid,
+    session_id: identitySeed.sessionId,
+  })
+}
+
+function anonymizeMetadataUserId(
+  parsed: Record<string, unknown>,
+  options: TransformBodyOptions | undefined,
+): void {
+  if (!options?.identitySeed) {
+    return
+  }
+
+  ensureMetadataUserId(parsed, options.identitySeed)
+  if (!options.anonymizeIdentity) {
+    return
+  }
+
+  const metadataRecord = parsed.metadata as Record<string, unknown>
+  if (typeof metadataRecord.user_id !== "string") {
+    return
+  }
+
+  try {
+    const userId = JSON.parse(metadataRecord.user_id) as Record<string, unknown>
+    metadataRecord.user_id = JSON.stringify({
+      ...userId,
+      device_id: options.identitySeed.deviceId,
+      account_uuid: options.identitySeed.accountUuid,
+      session_id: options.identitySeed.sessionId,
+    })
+  } catch {
+    // Leave malformed metadata untouched
+  }
+}
+
 export function repairToolPairs(messages: Message[]): Message[] {
   // Collect all tool_use ids and tool_result tool_use_ids
   const toolUseIds = new Set<string>()
@@ -91,6 +163,7 @@ export function repairToolPairs(messages: Message[]): Message[] {
 
 export function transformBody(
   body: BodyInit | null | undefined,
+  options?: TransformBodyOptions,
 ): BodyInit | null | undefined {
   if (typeof body !== "string") {
     return body
@@ -110,7 +183,9 @@ export function transformBody(
           | string
           | Array<{ type?: string; text?: string } & Record<string, unknown>>
       }>
-    }
+    } & Record<string, unknown>
+
+    anonymizeMetadataUserId(parsed, options)
 
     // --- Billing header: inject as system[0] (no cache_control) ---
     const version = process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion

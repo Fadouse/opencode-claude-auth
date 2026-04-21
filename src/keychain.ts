@@ -9,6 +9,8 @@ export interface ClaudeCredentials {
   refreshToken: string
   expiresAt: number
   subscriptionType?: string
+  userID?: string
+  accountUuid?: string
 }
 
 export interface ClaudeAccount {
@@ -181,6 +183,30 @@ function readCredentialsFile(): ClaudeCredentials | null {
   }
 }
 
+function readClaudeStateFile(): {
+  userID?: string
+  accountUuid?: string
+} {
+  try {
+    const statePath = join(homedir(), ".claude.json")
+    const raw = readFileSync(statePath, "utf-8")
+    const parsed = JSON.parse(raw) as {
+      userID?: unknown
+      oauthAccount?: { accountUuid?: unknown }
+    }
+
+    return {
+      userID: typeof parsed.userID === "string" ? parsed.userID : undefined,
+      accountUuid:
+        typeof parsed.oauthAccount?.accountUuid === "string"
+          ? parsed.oauthAccount.accountUuid
+          : undefined,
+    }
+  } catch {
+    return {}
+  }
+}
+
 export function buildAccountLabels(credsList: ClaudeCredentials[]): string[] {
   const baseLabels = credsList.map((c) => {
     if (c.subscriptionType) {
@@ -204,11 +230,19 @@ export function buildAccountLabels(credsList: ClaudeCredentials[]): string[] {
 }
 
 export function readAllClaudeAccounts(): ClaudeAccount[] {
+  const persistedState = readClaudeStateFile()
+
   if (process.platform !== "darwin") {
     const creds = readCredentialsFile()
     if (!creds) return []
     const [label] = buildAccountLabels([creds])
-    return [{ label, source: "file", credentials: creds }]
+    return [
+      {
+        label,
+        source: "file",
+        credentials: { ...creds, ...persistedState },
+      },
+    ]
   }
 
   const services = listClaudeKeychainServices()
@@ -220,12 +254,20 @@ export function readAllClaudeAccounts(): ClaudeAccount[] {
     if (!raw) continue
     const creds = parseCredentials(raw)
     if (!creds) continue
-    rawAccounts.push({ source: svc, credentials: creds })
+    rawAccounts.push({
+      source: svc,
+      credentials: { ...creds, ...persistedState },
+    })
   }
 
   if (rawAccounts.length === 0) {
     const creds = readCredentialsFile()
-    if (creds) rawAccounts.push({ source: "file", credentials: creds })
+    if (creds) {
+      rawAccounts.push({
+        source: "file",
+        credentials: { ...creds, ...persistedState },
+      })
+    }
   }
 
   const labels = buildAccountLabels(rawAccounts.map((a) => a.credentials))

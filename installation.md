@@ -79,6 +79,27 @@ cat ~/.config/opencode/opencode.json
 
 You should see `opencode-claude-auth@latest` in the `plugin` array.
 
+### Step 3: Optional extra provider
+
+If you want to keep the official `anthropic` provider and register a second relay/proxy provider from this plugin, add `apiKeyProvider` under any agent config:
+
+```json
+{
+  "plugin": ["opencode-claude-auth@latest"],
+  "agent": {
+    "build": {
+      "apiKeyProvider": {
+        "id": "relay",
+        "baseURL": "https://relay.example.com/v1",
+        "apiKey": "sk-your-relay-key"
+      }
+    }
+  }
+}
+```
+
+This leaves the existing `anthropic` provider in place and adds a second provider named `relay`.
+
 ## Upgrading
 
 If you previously installed `opencode-claude-auth` without the `@latest` tag, update your config to use `opencode-claude-auth@latest` as shown above.

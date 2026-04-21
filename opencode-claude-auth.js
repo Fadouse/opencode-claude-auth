@@ -1,2 +1,2 @@
 // Entry point: re-exports the compiled plugin from dist/
-export { ClaudeAuthPlugin, default } from "./dist/index.js"
+export { ClaudeAuthPlugin, ApiKeyProviderPlugin, default } from "./dist/index.js"

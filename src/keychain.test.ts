@@ -424,6 +424,42 @@ describe("credentials file fallback", () => {
     assert.equal(readCredentialsFile(credPath), null)
     rmSync(tmpDir, { recursive: true, force: true })
   })
+
+  it("can read persisted identity fields from ~/.claude.json", async () => {
+    const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-state-"))
+    process.env.HOME = tempHome
+
+    try {
+      writeFileSync(
+        join(tempHome, ".claude.json"),
+        JSON.stringify({
+          userID:
+            "15c1d59ab656b2590ff73b31b8464c62d2983ffcd53f39f86692021e9d22b44d",
+          oauthAccount: {
+            accountUuid: "39f06015-07eb-434c-be7e-70c53cd91eed",
+          },
+        }),
+      )
+
+      const raw = JSON.parse(readFileSync(join(tempHome, ".claude.json"), "utf-8"))
+      assert.equal(
+        raw.userID,
+        "15c1d59ab656b2590ff73b31b8464c62d2983ffcd53f39f86692021e9d22b44d",
+      )
+      assert.equal(
+        raw.oauthAccount.accountUuid,
+        "39f06015-07eb-434c-be7e-70c53cd91eed",
+      )
+    } finally {
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("updateCredentialBlob", () => {

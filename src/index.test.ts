@@ -9,8 +9,12 @@ import {
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
-import { before, describe, it } from "node:test"
+import { afterEach, before, describe, it } from "node:test"
 import { pathToFileURL } from "node:url"
+import {
+  applyOpencodeConfig,
+  resetPluginSettings,
+} from "./plugin-config.ts"
 
 interface ClaudeCredentials {
   accessToken: string
@@ -278,6 +282,16 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     assert.equal(headers.get("anthropic-version"), "2023-06-01")
     assert.equal(headers.get("x-api-key"), null)
     assert.equal(headers.get("x-custom"), "keep-me")
+    assert.equal(headers.get("x-app"), "cli")
+    assert.equal(headers.get("anthropic-dangerous-direct-browser-access"), "true")
+    assert.equal(headers.get("x-stainless-arch"), "x64")
+    assert.equal(headers.get("x-stainless-lang"), "js")
+    assert.equal(headers.get("x-stainless-os"), "Linux")
+    assert.equal(headers.get("x-stainless-package-version"), "0.81.0")
+    assert.equal(headers.get("x-stainless-retry-count"), "0")
+    assert.equal(headers.get("x-stainless-runtime"), "node")
+    assert.equal(headers.get("x-stainless-runtime-version"), "v24.3.0")
+    assert.equal(headers.get("x-stainless-timeout"), "600")
     assert.ok(headers.get("anthropic-beta")?.includes("custom-beta"))
     assert.equal(
       headers.get("x-anthropic-billing-header"),
@@ -389,6 +403,19 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     } finally {
       delete process.env.ANTHROPIC_USER_AGENT
     }
+  })
+
+  it("buildRequestHeaders defaults to official CLI version 2.1.116", () => {
+    const headers = helpers.buildRequestHeaders(
+      "https://api.anthropic.com/v1/messages",
+      { headers: {} },
+      "token",
+      "claude-sonnet-4-6",
+    )
+    assert.equal(
+      headers.get("user-agent"),
+      "claude-cli/2.1.116 (external, cli)",
+    )
   })
 
   it("ANTHROPIC_CLI_VERSION overrides version in billing header (via transformBody)", () => {
@@ -688,6 +715,222 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         delete process.env.HOME
       }
     }
+  })
+})
+
+describe("plugin exports", () => {
+  afterEach(() => {
+    resetPluginSettings()
+  })
+
+  it("exports a separate API key provider plugin alongside ClaudeAuthPlugin", async () => {
+    const mod = await import(pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href)
+
+    assert.equal(typeof mod.ClaudeAuthPlugin, "function")
+    assert.equal(typeof mod.ApiKeyProviderPlugin, "function")
+    assert.notEqual(mod.ClaudeAuthPlugin, mod.ApiKeyProviderPlugin)
+  })
+
+  it("API key provider plugin registers auth under configured provider id", async () => {
+    applyOpencodeConfig({
+      agent: {
+        build: {
+          apiKeyProvider: {
+            id: "relay",
+            baseURL: "https://relay.example.com/v1",
+            apiKey: "relay-key",
+          },
+        },
+      },
+    })
+
+    const mod = await import(pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href)
+    const plugin = await mod.ApiKeyProviderPlugin({} as never)
+
+    assert.equal(plugin.auth?.provider, "relay")
+  })
+
+  it("API key provider rewrites title-generation requests to configured smallModel", async () => {
+    applyOpencodeConfig({
+      agent: {
+        build: {
+          apiKeyProvider: {
+            id: "relay",
+            baseURL: "https://relay.example.com/v1",
+            apiKey: "relay-key",
+            smallModel: "claude-haiku-4-5-20251001",
+          },
+        },
+      },
+    })
+
+    const mod = await import(
+      pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href
+    )
+
+    let bodySeen = ""
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodySeen = typeof init?.body === "string" ? init.body : ""
+      return new Response("ok")
+    }) as typeof fetch
+
+    try {
+      const plugin = await mod.ApiKeyProviderPlugin({} as never)
+      const typedPlugin = plugin as {
+        auth?: {
+          loader?: (
+            auth: () => Promise<{ type: "api"; key: string }>,
+            provider: { models: Record<string, { cost?: unknown }> },
+          ) => Promise<{
+            fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+          }>
+        }
+      }
+      const authConfig = await typedPlugin.auth!.loader!(
+        async () => ({
+          type: "api",
+          key: "relay-key",
+        }),
+        { models: {} },
+      )
+
+      await authConfig.fetch("https://relay.example.com/v1/messages", {
+        method: "POST",
+        body: JSON.stringify({
+          model: "claude-haiku-4-5",
+          system: [
+            {
+              type: "text",
+              text: "You are a title generator. You output ONLY a thread title. Nothing else.",
+            },
+          ],
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      })
+
+      const parsed = JSON.parse(bodySeen) as { model: string }
+      assert.equal(parsed.model, "claude-haiku-4-5-20251001")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it("buildRequestHeaders preserves x-api-key when explicitly requested", () => {
+    const headers = helpers.buildRequestHeaders(
+      "https://relay.example.com/v1/messages",
+      {
+        headers: {
+          "x-api-key": "relay-key",
+        },
+      },
+      "unused-bearer",
+      "claude-opus-4-6",
+      undefined,
+      undefined,
+      { preserveApiKey: true },
+    )
+
+    assert.equal(headers.get("x-api-key"), "relay-key")
+    assert.equal(headers.get("authorization"), "Bearer unused-bearer")
+  })
+})
+
+describe("custom provider config injection", () => {
+  afterEach(() => {
+    resetPluginSettings()
+  })
+
+  it("injects custom provider without embedding apiKey in provider options", async () => {
+    applyOpencodeConfig({
+      agent: {
+        build: {
+          apiKeyProvider: {
+            id: "relay",
+            baseURL: "https://relay.example.com/v1",
+            apiKey: "relay-key",
+            smallModel: "claude-sonnet-4-6",
+          },
+        },
+      },
+    })
+
+    const mod = await import(pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href)
+    const plugin = await mod.ApiKeyProviderPlugin({} as never)
+    const mutableConfig = {
+      model: "relay/claude-opus-4-6",
+      provider: {} as Record<string, unknown>,
+    }
+
+    await plugin.config?.(mutableConfig as never)
+
+    const relay = mutableConfig.provider["relay"] as {
+      small_model?: string
+      options?: Record<string, unknown>
+      models?: Record<string, unknown>
+    }
+    assert.equal(relay.options?.baseURL, "https://relay.example.com/v1")
+    assert.equal("apiKey" in (relay.options ?? {}), false)
+    assert.equal(mutableConfig.small_model, "relay/claude-sonnet-4-6")
+    assert.deepEqual(
+      (relay.models?.["claude-sonnet-4-6"] as {
+        reasoning?: boolean
+        variants?: Record<string, unknown>
+      })?.variants,
+      {
+        low: { effort: "low" },
+        medium: { effort: "medium" },
+        high: { effort: "high" },
+        max: { effort: "max" },
+      },
+    )
+    assert.equal(
+      (relay.models?.["claude-sonnet-4-6"] as { reasoning?: boolean })
+        ?.reasoning,
+      true,
+    )
+    assert.equal(
+      (relay.models?.["claude-haiku-4-5-20251001"] as {
+        reasoning?: boolean
+      })?.reasoning,
+      false,
+    )
+    assert.equal(
+      "variants" in
+        ((relay.models?.["claude-haiku-4-5-20251001"] as Record<
+          string,
+          unknown
+        >) ?? {}),
+      false,
+    )
+  })
+
+  it("does not override anthropic small_model selection", async () => {
+    applyOpencodeConfig({
+      agent: {
+        build: {
+          apiKeyProvider: {
+            id: "relay",
+            baseURL: "https://relay.example.com/v1",
+            apiKey: "relay-key",
+            smallModel: "claude-sonnet-4-6",
+          },
+        },
+      },
+    })
+
+    const mod = await import(
+      pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href
+    )
+    const plugin = await mod.ApiKeyProviderPlugin({} as never)
+    const mutableConfig = {
+      model: "anthropic/claude-opus-4-6",
+      provider: {} as Record<string, unknown>,
+    }
+
+    await plugin.config?.(mutableConfig as never)
+
+    assert.equal("small_model" in mutableConfig, false)
   })
 })
 

@@ -4,13 +4,15 @@
 [![CI](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml)
 [![Socket Badge](https://socket.dev/api/badge/npm/package/opencode-claude-auth)](https://socket.dev/npm/package/opencode-claude-auth)
 
-Self-contained Anthropic auth provider for OpenCode using your Claude Code credentials — no separate login or API key needed.
+Self-contained Anthropic auth provider for OpenCode using your Claude Code credentials, with an optional second API-key-backed provider for relay/proxy setups.
 
 ## How it works
 
-The plugin registers its own auth provider with a custom fetch handler that intercepts all Anthropic API requests. It reads OAuth tokens from the macOS Keychain (or `~/.claude/.credentials.json` on other platforms), caches them in memory with a 30-second TTL, and handles the full request lifecycle — no builtin Anthropic auth plugin required. On macOS, multiple Claude Code accounts are detected automatically and can be switched via `opencode auth login`.
+The plugin registers its own Anthropic auth provider with a custom fetch handler that intercepts all Anthropic API requests. It reads OAuth tokens from the macOS Keychain (or `~/.claude/.credentials.json` on other platforms), caches them in memory with a 30-second TTL, and handles the full request lifecycle — no builtin Anthropic auth plugin required. On macOS, multiple Claude Code accounts are detected automatically and can be switched via `opencode auth login`.
 
 It also syncs credentials to OpenCode's `auth.json` as a fallback (on Windows, it writes to both `%USERPROFILE%\.local\share\opencode\auth.json` and `%LOCALAPPDATA%\opencode\auth.json` to cover all installation methods). If a token is near expiry, it refreshes directly via Anthropic's OAuth endpoint (zero LLM tokens consumed), falling back to the Claude CLI if the direct refresh fails. Background re-sync runs every 5 minutes.
+
+When configured, the plugin also registers a second provider using your custom provider `id`. That provider reads `baseURL` and `apiKey` from `opencode.json`, keeps the same request-shaping algorithm and headers, and anonymizes Claude-derived identity fields before requests leave your machine.
 
 ## Prerequisites
 
@@ -51,7 +53,26 @@ See [installation.md](installation.md) for step-by-step agent instructions.
 
 ## Usage
 
-Just run OpenCode. The plugin handles auth automatically — it reads your Claude Code credentials, provides them to the Anthropic API, and refreshes them in the background. If your credentials aren't OAuth-based, the plugin falls through to standard API key auth.
+Just run OpenCode. The plugin handles Anthropic auth automatically — it reads your Claude Code credentials, provides them to the Anthropic API, and refreshes them in the background.
+
+To register an additional API-key-backed provider, add `apiKeyProvider` under any agent config in `opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-claude-auth@latest"],
+  "agent": {
+    "build": {
+      "apiKeyProvider": {
+        "id": "relay",
+        "baseURL": "https://relay.example.com/v1",
+        "apiKey": "sk-your-relay-key"
+      }
+    }
+  }
+}
+```
+
+This keeps the official `anthropic` provider intact and adds a second provider named `relay`. Requests sent through that second provider still use the plugin's Claude-compatible request shaping, but `metadata.user_id.device_id`, `metadata.user_id.account_uuid`, `metadata.user_id.session_id`, and `X-Claude-Code-Session-Id` are replaced with synthetic values.
 
 ## Supported models
 
@@ -196,11 +217,14 @@ export ANTHROPIC_ENABLE_1M_CONTEXT=true  # requires Claude Max
 ## How it works (technical)
 
 - Registers an `auth.loader` with a custom `fetch` that intercepts all Anthropic API requests
+- Optionally registers a second API-key-backed provider using a config-defined provider id
 - Sets `Authorization: Bearer` with fresh OAuth tokens (cached in memory, 30s TTL, updated in-place after refresh)
+- For the optional API-key provider, sets `Authorization: Bearer` from configured `apiKey` and injects configured `baseURL`
 - Translates tool names between OpenCode and Anthropic API formats (adds/strips `mcp_` prefix)
 - Buffers SSE response streams at event boundaries for reliable tool name translation
 - Injects Claude Code identity into system prompts via `experimental.chat.system.transform`
 - Injects protocol-aligned billing metadata into the Anthropic request `system` field and sets `metadata.user_id` when a single Claude account can be mapped safely
+- For the optional API-key provider, anonymizes `metadata.user_id.{device_id,account_uuid,session_id}` and decouples `X-Claude-Code-Session-Id` from local Claude state
 - Sets required API headers (beta flags, billing, user-agent) with model-aware selection
 - Reverse-engineering notes in `protocl.md` now document the recovered official `W6H()` builder, where `metadata.user_id` is a JSON-encoded core bundle containing `{device_id, account_uuid, session_id}` (with parseable extra metadata merged when present) rather than a plain scalar id
 - Reverse-engineering notes in `protocl.md` also document recovered Claude Code telemetry builders (`Zw4`, `vw4`), showing that telemetry and request metadata share the same underlying device/account/session context

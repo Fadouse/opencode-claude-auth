@@ -137,6 +137,39 @@ function syncToPath(authPath: string, creds: ClaudeCredentials): void {
   }
 }
 
+function syncApiKeyToPath(
+  authPath: string,
+  providerId: string,
+  apiKey: string,
+): void {
+  let auth: Record<string, unknown> = {}
+  if (existsSync(authPath)) {
+    const raw = readFileSync(authPath, "utf-8").trim()
+    if (raw) {
+      try {
+        auth = JSON.parse(raw)
+      } catch {
+        // Malformed file, start fresh
+      }
+    }
+  }
+  auth[providerId] = {
+    type: "api",
+    key: apiKey,
+  }
+  const dir = dirname(authPath)
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+  }
+  writeFileSync(authPath, JSON.stringify(auth, null, 2), {
+    encoding: "utf-8",
+    mode: 0o600,
+  })
+  if (process.platform !== "win32") {
+    chmodSync(authPath, 0o600)
+  }
+}
+
 export function syncAuthJson(creds: ClaudeCredentials): void {
   for (const authPath of getAuthJsonPaths()) {
     try {
@@ -146,6 +179,23 @@ export function syncAuthJson(creds: ClaudeCredentials): void {
       log("sync_auth_json", {
         path: authPath,
         success: false,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      throw err
+    }
+  }
+}
+
+export function syncApiKeyAuthJson(providerId: string, apiKey: string): void {
+  for (const authPath of getAuthJsonPaths()) {
+    try {
+      syncApiKeyToPath(authPath, providerId, apiKey)
+      log("sync_auth_json", { path: authPath, success: true, providerId })
+    } catch (err) {
+      log("sync_auth_json", {
+        path: authPath,
+        success: false,
+        providerId,
         error: err instanceof Error ? err.message : String(err),
       })
       throw err

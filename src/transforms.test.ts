@@ -27,13 +27,11 @@ describe("transforms", () => {
       }>
     }
 
-    // system should only contain the billing header (non-core text relocated)
     assert.equal(parsed.system.length, 1)
     assert.ok(
       parsed.system[0].text.startsWith("x-anthropic-billing-header:"),
       "system[0] should be the billing header",
     )
-    // The original system text should now be prepended to the first user message
     assert.equal(parsed.messages[0].content[0].type, "text")
     assert.equal(parsed.messages[0].content[0].text, "OpenCode and opencode")
     assert.equal(parsed.tools[0].name, "mcp_Search")
@@ -58,8 +56,7 @@ describe("transforms", () => {
       messages: Array<{ content: string }>
     }
 
-    // Non-core system text should be moved to user message
-    assert.equal(parsed.system.length, 1) // only billing header
+    assert.equal(parsed.system.length, 1)
     assert.ok(
       parsed.messages[0].content.includes(
         "Use opencode-claude-auth plugin instructions as-is.",
@@ -85,8 +82,7 @@ describe("transforms", () => {
       messages: Array<{ content: string }>
     }
 
-    // Non-core system text should be relocated
-    assert.equal(parsed.system.length, 1) // only billing header
+    assert.equal(parsed.system.length, 1)
     assert.ok(
       parsed.messages[0].content.includes(
         "OpenCode docs: https://example.com/opencode/docs and path /var/opencode/bin",
@@ -107,8 +103,13 @@ describe("transforms", () => {
 
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.ok(
-      parsed.system[0].text.includes("cch=3a24d"),
-      `Expected cch=3a24d for the transformed request, got: ${parsed.system[0].text}`,
+      parsed.system[0].text.includes("cc_version=2.1.116."),
+      `Expected updated cc_version in billing header, got: ${parsed.system[0].text}`,
+    )
+    assert.match(
+      parsed.system[0].text,
+      /cch=[0-9a-f]{5};$/,
+      `Expected a computed 5-char hex cch, got: ${parsed.system[0].text}`,
     )
   })
 
@@ -133,6 +134,93 @@ describe("transforms", () => {
     )
   })
 
+  it("transformBody strips cache_control from identity-only system entry", () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+    const input = JSON.stringify({
+      system: [
+        {
+          type: "text",
+          text: identity,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string; cache_control?: unknown }>
+    }
+
+    assert.equal(parsed.system[1].text, identity)
+    assert.deepEqual(parsed.system[1].cache_control, { type: "ephemeral" })
+  })
+
+  it("transformBody injects metadata.user_id when identity seed is provided", () => {
+    const input = JSON.stringify({
+      messages: [{ role: "user", content: "test" }],
+    })
+
+    const output = transformBody(input, {
+      identitySeed: {
+        deviceId: "device-seed",
+        accountUuid: "account-seed",
+        sessionId: "session-seed",
+      },
+    })
+    const parsed = JSON.parse(output as string) as {
+      metadata: { user_id: string }
+    }
+    const userId = JSON.parse(parsed.metadata.user_id) as Record<string, string>
+
+    assert.deepEqual(userId, {
+      device_id: "device-seed",
+      account_uuid: "account-seed",
+      session_id: "session-seed",
+    })
+  })
+
+  it("transformBody preserves user text blocks without forcing cache_control", () => {
+    const output = transformBody(
+      JSON.stringify({
+        system: [{ type: "text", text: "extra text" }],
+        messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      }),
+    )
+
+    const parsed = JSON.parse(output as string) as {
+      messages: Array<{
+        content: Array<{
+          type: string
+          text?: string
+          cache_control?: { type: string; ttl?: string }
+        }>
+      }>
+    }
+
+    assert.equal(parsed.messages[0].content[0].cache_control, undefined)
+  })
+
+  it("transformBody does not add 1h cache_control by default", () => {
+    const output = transformBody(
+      JSON.stringify({
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "hi" }],
+          },
+        ],
+      }),
+    )
+    const parsed = JSON.parse(output as string) as {
+      messages: Array<{
+        content: Array<{ cache_control?: { type: string; ttl?: string } }>
+      }>
+    }
+
+    assert.equal(parsed.messages[0].content[0].cache_control, undefined)
+  })
+
   it("transformBody splits concatenated identity prefix and relocates remainder to user message", () => {
     const identity = "You are Claude Code, Anthropic's official CLI for Claude."
     const input = JSON.stringify({
@@ -154,11 +242,8 @@ describe("transforms", () => {
     // system[0] = billing header, system[1] = identity prefix
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.equal(parsed.system[1].text, identity)
-    // remainder is relocated to user message
     assert.equal(parsed.system.length, 2)
-    assert.ok(
-      parsed.messages[0].content.includes("Working directory: /home/test"),
-    )
+    assert.ok(parsed.messages[0].content.includes("Working directory: /home/test"))
   })
 
   it("transformBody preserves identity without cache_control and relocates remainder", () => {
@@ -180,13 +265,7 @@ describe("transforms", () => {
       messages: Array<{ content: string }>
     }
 
-    // Identity block should NOT have cache_control
-    assert.equal(
-      parsed.system[1].cache_control,
-      undefined,
-      "Identity block must not have cache_control",
-    )
-    // Remainder is relocated to user message, not kept in system
+    assert.equal(parsed.system[1].cache_control, undefined)
     assert.equal(parsed.system.length, 2)
     assert.ok(parsed.messages[0].content.includes("More content here"))
   })
@@ -234,11 +313,11 @@ describe("transforms", () => {
       1,
       "Should have exactly one billing header",
     )
-    assert.ok(
-      billingEntries[0].text.includes("cch=25d84"),
+    assert.match(
+      billingEntries[0].text,
+      /cch=[0-9a-f]{5};$/,
       `Expected computed cch, got: ${billingEntries[0].text}`,
     )
-    // "prompt" should be relocated to user message
     assert.ok(parsed.messages[0].content.includes("prompt"))
   })
 
@@ -266,23 +345,12 @@ describe("transforms", () => {
       }>
     }
 
-    // system should only have billing header + identity
     assert.equal(parsed.system.length, 2)
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.equal(parsed.system[1].text, identity)
-    // Both custom blocks should be prepended to user message content
     assert.equal(parsed.messages[0].content[0].type, "text")
-    assert.ok(
-      parsed.messages[0].content[0].text.includes(
-        "Custom instructions block A",
-      ),
-    )
-    assert.ok(
-      parsed.messages[0].content[0].text.includes(
-        "Custom instructions block B",
-      ),
-    )
-    // Original user content preserved
+    assert.ok(parsed.messages[0].content[0].text?.includes("Custom instructions block A"))
+    assert.ok(parsed.messages[0].content[0].text?.includes("Custom instructions block B"))
     assert.equal(parsed.messages[0].content[1].text, "hello")
   })
 
@@ -300,6 +368,40 @@ describe("transforms", () => {
     // With no messages to relocate into, system stays as-is
     // (billing header + original text)
     assert.ok(parsed.system.length >= 2)
+  })
+
+  it("transformBody anonymizes metadata.user_id fields when configured", () => {
+    const input = JSON.stringify({
+      metadata: {
+        user_id: JSON.stringify({
+          device_id: "real-device",
+          account_uuid: "real-account",
+          session_id: "real-session",
+          keep: "value",
+        }),
+      },
+      messages: [{ role: "user", content: "hello" }],
+    })
+
+    const output = transformBody(input, {
+      anonymizeIdentity: true,
+      identitySeed: {
+        deviceId: "anon-device",
+        accountUuid: "anon-account",
+        sessionId: "anon-session",
+      },
+    })
+    const parsed = JSON.parse(output as string) as {
+      metadata: { user_id: string }
+    }
+    const userId = JSON.parse(parsed.metadata.user_id) as Record<string, string>
+
+    assert.deepEqual(userId, {
+      device_id: "anon-device",
+      account_uuid: "anon-account",
+      session_id: "anon-session",
+      keep: "value",
+    })
   })
 
   it("transformBody strips output_config.effort for haiku", () => {

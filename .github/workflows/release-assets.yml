@@ -1,0 +1,40 @@
+name: Release Assets
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run build
+
+      - run: npm pack
+
+      - run: tar -czf opencode-claude-auth-dist-${{ github.event.release.tag_name }}.tar.gz dist opencode-claude-auth.js package.json README.md installation.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            opencode-claude-auth-*.tgz
+            opencode-claude-auth-dist-${{ github.event.release.tag_name }}.tar.gz
