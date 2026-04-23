@@ -163,6 +163,22 @@ export function isEnable1mContext(): boolean {
   return settings.enable1mContext === true
 }
 
+/**
+ * Whether 1h cache TTL should be enabled.
+ *
+ * When enabled, all existing cache_control blocks in the request body
+ * (system, messages, tools) are upgraded with `ttl: '1h'` and
+ * `scope: 'global'` to match the official CLI's getCacheControl()
+ * behaviour for eligible first-party users.
+ *
+ * Priority: ANTHROPIC_ENABLE_1H_CACHE_TTL env var > opencode.json > false
+ */
+export function isEnable1hCacheTTL(): boolean {
+  const envVal = process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL
+  if (envVal !== undefined) return envVal === "true"
+  return settings.enable1hCacheTTL === true
+}
+
 export function resetPluginSettings(): void {
   settings = {}
 }

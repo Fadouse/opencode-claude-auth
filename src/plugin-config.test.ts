@@ -7,16 +7,19 @@ import {
   applyOpencodeConfig,
   loadPluginSettingsFromFile,
   isEnable1mContext,
+  isEnable1hCacheTTL,
   resetPluginSettings,
   getPluginSettings,
 } from "./plugin-config.ts"
 
 describe("plugin-config", () => {
   let savedEnv: string | undefined
-
+  let saved1hEnv: string | undefined
   beforeEach(() => {
     savedEnv = process.env.ANTHROPIC_ENABLE_1M_CONTEXT
+    saved1hEnv = process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL
     delete process.env.ANTHROPIC_ENABLE_1M_CONTEXT
+    delete process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL
     resetPluginSettings()
   })
 
@@ -25,6 +28,11 @@ describe("plugin-config", () => {
       process.env.ANTHROPIC_ENABLE_1M_CONTEXT = savedEnv
     } else {
       delete process.env.ANTHROPIC_ENABLE_1M_CONTEXT
+    }
+    if (saved1hEnv !== undefined) {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = saved1hEnv
+    } else {
+      delete process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL
     }
     resetPluginSettings()
   })
@@ -65,6 +73,45 @@ describe("plugin-config", () => {
       })
       process.env.ANTHROPIC_ENABLE_1M_CONTEXT = "true"
       assert.equal(isEnable1mContext(), true)
+    })
+  })
+
+  describe("isEnable1hCacheTTL", () => {
+    it("returns false by default when neither env nor config is set", () => {
+      assert.equal(isEnable1hCacheTTL(), false)
+    })
+
+    it("returns true when env var is set to 'true'", () => {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
+      assert.equal(isEnable1hCacheTTL(), true)
+    })
+
+    it("returns false when env var is set to 'false'", () => {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "false"
+      assert.equal(isEnable1hCacheTTL(), false)
+    })
+
+    it("returns true when config sets enable1hCacheTTL", () => {
+      applyOpencodeConfig({
+        agent: { build: { enable1hCacheTTL: true } },
+      })
+      assert.equal(isEnable1hCacheTTL(), true)
+    })
+
+    it("env var overrides config (env=false, config=true)", () => {
+      applyOpencodeConfig({
+        agent: { build: { enable1hCacheTTL: true } },
+      })
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "false"
+      assert.equal(isEnable1hCacheTTL(), false)
+    })
+
+    it("env var overrides config (env=true, config=false)", () => {
+      applyOpencodeConfig({
+        agent: { build: { enable1hCacheTTL: false } },
+      })
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
+      assert.equal(isEnable1hCacheTTL(), true)
     })
   })
 

@@ -3,6 +3,7 @@ import {
   fillCchInSerializedBody,
 } from "./signing.ts"
 import { config, getModelOverride } from "./model-config.ts"
+import { isEnable1hCacheTTL } from "./plugin-config.ts"
 
 const TOOL_PREFIX = "mcp_"
 
@@ -159,6 +160,62 @@ export function repairToolPairs(messages: Message[]): Message[] {
       (message) =>
         !(Array.isArray(message.content) && message.content.length === 0),
     )
+}
+
+const BILLING_HEADER_PREFIX = "x-anthropic-billing-header"
+
+type CacheControl = { type: string; ttl?: string; scope?: string }
+
+/**
+ * Upgrade existing `cache_control` blocks in system, tools, and messages
+ * to include `ttl: '1h'` and `scope: 'global'` when the 1h cache TTL
+ * feature is enabled.
+ *
+ * Matches the official CLI's getCacheControl() output:
+ *   { type: 'ephemeral', ttl: '1h', scope: 'global' }
+ *
+ * Rules:
+ * - Only upgrades blocks that ALREADY have a `cache_control` field —
+ *   never injects cache_control where one doesn't exist.
+ * - Skips the billing header (system[0]) which must never carry
+ *   cache_control (matches official cacheScope=null).
+ */
+function applyCacheControlUpgrades(parsed: {
+  system?: SystemEntry[]
+  tools?: Array<Record<string, unknown>>
+  messages?: Message[]
+}): void {
+  if (!isEnable1hCacheTTL()) return
+
+  const upgrade = (block: Record<string, unknown>): void => {
+    const cc = block.cache_control as CacheControl | undefined
+    if (!cc || typeof cc !== "object" || cc.type !== "ephemeral") return
+    block.cache_control = { ...cc, ttl: "1h", scope: "global" }
+  }
+
+  // System blocks — skip index 0 (billing header, must stay without cache_control)
+  if (Array.isArray(parsed.system)) {
+    for (let i = 1; i < parsed.system.length; i++) {
+      upgrade(parsed.system[i] as Record<string, unknown>)
+    }
+  }
+
+  // Tool schemas
+  if (Array.isArray(parsed.tools)) {
+    for (const tool of parsed.tools) {
+      upgrade(tool)
+    }
+  }
+
+  // Message content blocks
+  if (Array.isArray(parsed.messages)) {
+    for (const message of parsed.messages) {
+      if (!Array.isArray(message.content)) continue
+      for (const block of message.content) {
+        upgrade(block as Record<string, unknown>)
+      }
+    }
+  }
 }
 
 export function transformBody(
@@ -332,6 +389,13 @@ export function transformBody(
     if (Array.isArray(parsed.messages)) {
       parsed.messages = repairToolPairs(parsed.messages)
     }
+
+    // Upgrade cache_control blocks with 1h TTL + global scope when enabled
+    applyCacheControlUpgrades(parsed as {
+      system?: SystemEntry[]
+      tools?: Array<Record<string, unknown>>
+      messages?: Message[]
+    })
 
     return fillCchInSerializedBody(JSON.stringify(parsed))
   } catch {

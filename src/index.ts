@@ -55,7 +55,7 @@ export {
   refreshAccountsList,
   type ClaudeCredentials,
 } from "./credentials.ts"
-export { isEnable1mContext, type PluginSettings } from "./plugin-config.ts"
+export { isEnable1mContext, isEnable1hCacheTTL, type PluginSettings } from "./plugin-config.ts"
 export {
   buildBillingHeaderValue,
   computeCch,

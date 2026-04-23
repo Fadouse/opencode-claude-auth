@@ -1,11 +1,12 @@
 import assert from "node:assert/strict"
-import { describe, it } from "node:test"
+import { describe, it, beforeEach, afterEach } from "node:test"
 import {
   repairToolPairs,
   stripToolPrefix,
   transformBody,
   transformResponseStream,
 } from "./transforms.ts"
+import { applyOpencodeConfig, resetPluginSettings } from "./plugin-config.ts"
 
 describe("transforms", () => {
   it("transformBody moves non-core system text to user message and PascalCase-prefixes tool names", () => {
@@ -956,5 +957,238 @@ describe("transforms", () => {
       !text.includes("mcp_beta"),
       `Should not contain mcp_beta in: ${text}`,
     )
+  })
+
+  describe("cache_control upgrades with enable1hCacheTTL", () => {
+    let savedEnv: string | undefined
+
+    beforeEach(() => {
+      savedEnv = process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL
+      resetPluginSettings()
+    })
+
+    afterEach(() => {
+      if (savedEnv !== undefined) {
+        process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = savedEnv
+      } else {
+        delete process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL
+      }
+      resetPluginSettings()
+    })
+
+    it("upgrades system cache_control with ttl and scope when enabled", () => {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
+      // Use identity-exact text so it survives both identity-split (no split
+      // because length === SYSTEM_IDENTITY.length) and relocation (kept because
+      // it starts with SYSTEM_IDENTITY).
+      const input = JSON.stringify({
+        system: [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      })
+
+      const output = transformBody(input)
+      const parsed = JSON.parse(output as string) as {
+        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+      }
+
+      // Billing header (system[0]) should never have cache_control
+      assert.equal(parsed.system[0].cache_control, undefined)
+
+      // Identity block should be upgraded
+      const identity = parsed.system.find((e) =>
+        e.text.startsWith("You are Claude Code"),
+      )
+      assert.ok(identity, "Expected identity block")
+      assert.deepEqual(identity!.cache_control, {
+        type: "ephemeral",
+        ttl: "1h",
+        scope: "global",
+      })
+    })
+
+    it("billing header never gets cache_control even when enabled", () => {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
+      const input = JSON.stringify({
+        system: [
+          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      })
+
+      const output = transformBody(input)
+      const parsed = JSON.parse(output as string) as {
+        system: Array<{ text: string; cache_control?: unknown }>
+      }
+
+      // system[0] = billing header, must not have cache_control
+      assert.equal(parsed.system[0].cache_control, undefined)
+    })
+
+    it("does not upgrade cache_control when feature is disabled", () => {
+      // Feature disabled by default (no env, no config)
+      const input = JSON.stringify({
+        system: [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      })
+
+      const output = transformBody(input)
+      const parsed = JSON.parse(output as string) as {
+        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+      }
+
+      // Identity block should keep original cache_control without ttl/scope
+      const identity = parsed.system.find((e) =>
+        e.text.startsWith("You are Claude Code"),
+      )
+      assert.ok(identity, "Expected identity block with cache_control")
+      assert.equal(identity!.cache_control!.type, "ephemeral")
+      assert.equal(identity!.cache_control!.ttl, undefined)
+      assert.equal(identity!.cache_control!.scope, undefined)
+    })
+
+    it("upgrades tool cache_control when enabled", () => {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
+      const input = JSON.stringify({
+        system: [
+          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        ],
+        tools: [
+          { name: "search", cache_control: { type: "ephemeral" } },
+          { name: "read" },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      })
+
+      const output = transformBody(input)
+      const parsed = JSON.parse(output as string) as {
+        tools: Array<{ name: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+      }
+
+      // Tool with existing cache_control should be upgraded
+      const searchTool = parsed.tools.find((t) => t.name === "mcp_Search")
+      assert.ok(searchTool, "Expected mcp_Search tool")
+      assert.deepEqual(searchTool!.cache_control, {
+        type: "ephemeral",
+        ttl: "1h",
+        scope: "global",
+      })
+
+      // Tool without cache_control should NOT gain one
+      const readTool = parsed.tools.find((t) => t.name === "mcp_Read")
+      assert.ok(readTool, "Expected mcp_Read tool")
+      assert.equal(readTool!.cache_control, undefined)
+    })
+
+    it("upgrades message content block cache_control when enabled", () => {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
+      const input = JSON.stringify({
+        system: [
+          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        ],
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hello", cache_control: { type: "ephemeral" } },
+              { type: "text", text: "world" },
+            ],
+          },
+        ],
+      })
+
+      const output = transformBody(input)
+      const parsed = JSON.parse(output as string) as {
+        messages: Array<{
+          role: string
+          content: Array<{ type: string; text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+        }>
+      }
+
+      const blocks = parsed.messages[0].content
+      // Block with cache_control should be upgraded
+      const cachedBlock = blocks.find((b) => b.cache_control !== undefined)
+      assert.ok(cachedBlock, "Expected a block with cache_control")
+      assert.deepEqual(cachedBlock!.cache_control, {
+        type: "ephemeral",
+        ttl: "1h",
+        scope: "global",
+      })
+
+      // Block without cache_control should NOT gain one
+      const plainBlock = blocks.find((b) => b.text === "world")
+      assert.ok(plainBlock, "Expected plain text block")
+      assert.equal(plainBlock!.cache_control, undefined)
+    })
+
+    it("does not upgrade non-ephemeral cache_control types", () => {
+      process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
+      // Use identity-exact text with a non-ephemeral cache_control
+      const input = JSON.stringify({
+        system: [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+            cache_control: { type: "other" },
+          },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      })
+
+      const output = transformBody(input)
+      const parsed = JSON.parse(output as string) as {
+        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+      }
+
+      const identity = parsed.system.find((e) =>
+        e.text.startsWith("You are Claude Code"),
+      )
+      assert.ok(identity, "Expected identity block")
+      assert.equal(identity!.cache_control!.type, "other")
+      assert.equal(identity!.cache_control!.ttl, undefined, "Should not add ttl to non-ephemeral")
+      assert.equal(identity!.cache_control!.scope, undefined, "Should not add scope to non-ephemeral")
+    })
+
+    it("works with config instead of env var", () => {
+      applyOpencodeConfig({
+        agent: { build: { enable1hCacheTTL: true } },
+      })
+      const input = JSON.stringify({
+        system: [
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        messages: [{ role: "user", content: "hello" }],
+      })
+
+      const output = transformBody(input)
+      const parsed = JSON.parse(output as string) as {
+        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+      }
+
+      const identity = parsed.system.find((e) =>
+        e.text.startsWith("You are Claude Code"),
+      )
+      assert.ok(identity, "Expected cache_control upgrade via config")
+      assert.deepEqual(identity!.cache_control, {
+        type: "ephemeral",
+        ttl: "1h",
+        scope: "global",
+      })
+    })
   })
 })
