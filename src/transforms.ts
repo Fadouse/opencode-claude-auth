@@ -168,11 +168,13 @@ type CacheControl = { type: string; ttl?: string; scope?: string }
 
 /**
  * Upgrade existing `cache_control` blocks in system, tools, and messages
- * to include `ttl: '1h'` and `scope: 'global'` when the 1h cache TTL
- * feature is enabled.
+ * to include `ttl: '1h'` when the 1h cache TTL feature is enabled.
  *
- * Matches the official CLI's getCacheControl() output:
- *   { type: 'ephemeral', ttl: '1h', scope: 'global' }
+ * We intentionally do NOT add `scope: 'global'` here. Global scope requires
+ * all preceding blocks to be globally scoped too, and our transformed request
+ * shape can render tool blocks before later system blocks. Adding
+ * `scope: 'global'` in this generic upgrade step therefore causes ordering
+ * violations that Anthropic rejects.
  *
  * Rules:
  * - Only upgrades blocks that ALREADY have a `cache_control` field —
@@ -190,7 +192,7 @@ function applyCacheControlUpgrades(parsed: {
   const upgrade = (block: Record<string, unknown>): void => {
     const cc = block.cache_control as CacheControl | undefined
     if (!cc || typeof cc !== "object" || cc.type !== "ephemeral") return
-    block.cache_control = { ...cc, ttl: "1h", scope: "global" }
+    block.cache_control = { ...cc, ttl: "1h" }
   }
 
   // System blocks — skip index 0 (billing header, must stay without cache_control)

@@ -1008,7 +1008,6 @@ describe("transforms", () => {
       assert.deepEqual(identity!.cache_control, {
         type: "ephemeral",
         ttl: "1h",
-        scope: "global",
       })
     })
 
@@ -1082,7 +1081,6 @@ describe("transforms", () => {
       assert.deepEqual(searchTool!.cache_control, {
         type: "ephemeral",
         ttl: "1h",
-        scope: "global",
       })
 
       // Tool without cache_control should NOT gain one
@@ -1123,7 +1121,6 @@ describe("transforms", () => {
       assert.deepEqual(cachedBlock!.cache_control, {
         type: "ephemeral",
         ttl: "1h",
-        scope: "global",
       })
 
       // Block without cache_control should NOT gain one
@@ -1187,7 +1184,6 @@ describe("transforms", () => {
       assert.deepEqual(identity!.cache_control, {
         type: "ephemeral",
         ttl: "1h",
-        scope: "global",
       })
     })
   })
