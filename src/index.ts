@@ -55,7 +55,11 @@ export {
   refreshAccountsList,
   type ClaudeCredentials,
 } from "./credentials.ts"
-export { isEnable1mContext, isEnable1hCacheTTL, type PluginSettings } from "./plugin-config.ts"
+export {
+  isEnable1mContext,
+  isEnable1hCacheTTL,
+  type PluginSettings,
+} from "./plugin-config.ts"
 export {
   buildBillingHeaderValue,
   computeCch,
@@ -104,8 +108,24 @@ function getCliVersion(): string {
 function getUserAgent(): string {
   return (
     process.env.ANTHROPIC_USER_AGENT ??
-    `claude-cli/${getCliVersion()} (external, cli)`
+    `claude-cli/${getCliVersion()} (external, sdk-cli)`
   )
+}
+
+function buildRequestUrl(input: RequestInfo | URL): string | URL {
+  const raw =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input.url
+
+  const url = new URL(raw)
+  if (url.pathname === "/v1/messages" && !url.searchParams.has("beta")) {
+    url.searchParams.set("beta", "true")
+  }
+
+  return typeof input === "string" ? url.toString() : url
 }
 
 // Stable per-process session ID, matching Claude Code's X-Claude-Code-Session-Id
@@ -128,6 +148,21 @@ const OFFICIAL_HEADER_DEFAULTS = {
   "x-stainless-timeout": "600",
 } as const
 
+// Maximum delay before we give up retrying and surface the error.
+// A retry-after longer than this signals a quota/usage-limit reset (hours away)
+// rather than a transient rate limit — retrying would hang indefinitely.
+// Override with OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS for longer retry windows.
+const DEFAULT_MAX_RETRY_DELAY_MS = 30_000
+
+function getMaxRetryDelayMs(): number {
+  const env = process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS
+  if (env) {
+    const parsed = parseInt(env, 10)
+    if (!Number.isNaN(parsed) && parsed > 0) return parsed
+  }
+  return DEFAULT_MAX_RETRY_DELAY_MS
+}
+
 export async function fetchWithRetry(
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -140,6 +175,17 @@ export async function fetchWithRetry(
       const retryAfter = res.headers.get("retry-after")
       const parsed = retryAfter ? parseInt(retryAfter, 10) : NaN
       const delay = Number.isNaN(parsed) ? (i + 1) * 2000 : parsed * 1000
+      // If delay exceeds the cap, the server is signalling a quota/usage-limit
+      // reset far in the future. Return immediately so the error surfaces to
+      // the user rather than silently hanging until the reset time.
+      if (delay > getMaxRetryDelayMs()) {
+        log("fetch_rate_limited_quota", {
+          status: res.status,
+          retryAfter: retryAfter ?? "none",
+          delayMs: delay,
+        })
+        return res
+      }
       log("fetch_rate_limited", {
         status: res.status,
         attempt: i + 1,
@@ -204,12 +250,13 @@ export function buildRequestHeaders(
   headers.set("authorization", `Bearer ${accessToken}`)
   headers.set("anthropic-version", "2023-06-01")
   headers.set("anthropic-beta", mergedBetas.join(","))
+  headers.set("anthropic-dangerous-direct-browser-access", "true")
   headers.set("x-app", "cli")
   headers.set("user-agent", getUserAgent())
   headers.set("x-client-request-id", crypto.randomUUID())
   headers.set("X-Claude-Code-Session-Id", requestSessionId ?? sessionId)
   for (const [key, value] of Object.entries(OFFICIAL_HEADER_DEFAULTS)) {
-    headers.set(key, value)
+    if (!headers.has(key)) headers.set(key, value)
   }
   if (!options?.preserveApiKey) {
     headers.delete("x-api-key")
@@ -278,7 +325,9 @@ function injectSystemIdentity(
   }
 }
 
-function zeroModelCosts(provider: { models: Record<string, { cost?: unknown }> }) {
+function zeroModelCosts(provider: {
+  models: Record<string, { cost?: unknown }>
+}) {
   for (const model of Object.values(provider.models)) {
     model.cost = {
       input: 0,
@@ -342,7 +391,9 @@ function stableHex(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex")
 }
 
-function buildOAuthIdentitySeed(creds: ClaudeCredentials): TransformIdentitySeed {
+function buildOAuthIdentitySeed(
+  creds: ClaudeCredentials,
+): TransformIdentitySeed {
   return {
     deviceId: creds.userID ?? stableHex(`device:${creds.accessToken}`),
     accountUuid:
@@ -374,7 +425,11 @@ function syncApiKeyAuthIfPossible(): void {
 
 function ensureApiKeyProviderConfig(opencodeConfig: unknown): void {
   const apiKeyProvider = getPluginSettings().apiKeyProvider
-  if (!apiKeyProvider || !opencodeConfig || typeof opencodeConfig !== "object") {
+  if (
+    !apiKeyProvider ||
+    !opencodeConfig ||
+    typeof opencodeConfig !== "object"
+  ) {
     return
   }
 
@@ -398,8 +453,7 @@ function ensureApiKeyProviderConfig(opencodeConfig: unknown): void {
   providerConfig[apiKeyProvider.id] = {
     ...existing,
     id: apiKeyProvider.id,
-    name:
-      typeof existing.name === "string" ? existing.name : apiKeyProvider.id,
+    name: typeof existing.name === "string" ? existing.name : apiKeyProvider.id,
     npm: typeof existing.npm === "string" ? existing.npm : API_KEY_PROVIDER_NPM,
     options: {
       ...existingOptions,
@@ -490,7 +544,11 @@ export const ClaudeAuthPlugin: Plugin = async () => {
       ensureApiKeyProviderConfig(opencodeConfig)
     },
     "experimental.chat.system.transform": async (input, output) => {
-      injectSystemIdentity(input.model?.providerID, output, OFFICIAL_PROVIDER_ID)
+      injectSystemIdentity(
+        input.model?.providerID,
+        output,
+        OFFICIAL_PROVIDER_ID,
+      )
     },
     auth: {
       provider: OFFICIAL_PROVIDER_ID,
@@ -541,6 +599,7 @@ export const ClaudeAuthPlugin: Plugin = async () => {
               ...requestInit,
               body,
             }
+            const requestUrl = buildRequestUrl(input)
             const headers = buildRequestHeaders(
               input,
               transformedInit,
@@ -556,9 +615,8 @@ export const ClaudeAuthPlugin: Plugin = async () => {
               .filter(Boolean)
             log("fetch_headers_built", { headerKeys, betas, modelId })
 
-            let response = await fetchWithRetry(input, {
-              ...requestInit,
-              body,
+            let response = await fetchWithRetry(requestUrl, {
+              ...transformedInit,
               headers,
             })
 
@@ -574,18 +632,17 @@ export const ClaudeAuthPlugin: Plugin = async () => {
               log("fetch_401_retry", { modelId })
               const refreshed = getCachedCredentials()
               if (refreshed && refreshed.accessToken !== latest.accessToken) {
-              const retryHeaders = buildRequestHeaders(
-                input,
-                transformedInit,
-                refreshed.accessToken,
-                modelId,
-                excluded,
-              )
-              response = await fetchWithRetry(input, {
-                ...transformedInit,
-                body,
-                headers: retryHeaders,
-              })
+                const retryHeaders = buildRequestHeaders(
+                  input,
+                  transformedInit,
+                  refreshed.accessToken,
+                  modelId,
+                  excluded,
+                )
+                response = await fetchWithRetry(requestUrl, {
+                  ...transformedInit,
+                  headers: retryHeaders,
+                })
                 log("fetch_401_retry_result", {
                   status: response.status,
                   modelId,
@@ -634,9 +691,8 @@ export const ClaudeAuthPlugin: Plugin = async () => {
                 newExcluded,
               )
 
-              response = await fetchWithRetry(input, {
+              response = await fetchWithRetry(requestUrl, {
                 ...transformedInit,
-                body,
                 headers: newHeaders,
               })
             }

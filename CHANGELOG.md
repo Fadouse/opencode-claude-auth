@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.5.3](https://github.com/griffinmartin/opencode-claude-auth/compare/v1.5.2...v1.5.3) (2026-04-30)
+
+
+### Bug Fixes
+
+* increase max buffer for reading keychain dump ([#201](https://github.com/griffinmartin/opencode-claude-auth/issues/201)) ([2f97161](https://github.com/griffinmartin/opencode-claude-auth/commit/2f97161d36810ee0d9c7be6de95c66bf844eee2f))
+
+## [1.5.2](https://github.com/griffinmartin/opencode-claude-auth/compare/v1.5.1...v1.5.2) (2026-04-30)
+
+
+### Bug Fixes
+
+* detect out-of-extra-usage error and cap retry-after delay ([#211](https://github.com/griffinmartin/opencode-claude-auth/issues/211)) ([88a114e](https://github.com/griffinmartin/opencode-claude-auth/commit/88a114efd273d3f32908a31494363adce30cd9de))
+
+## [1.5.1](https://github.com/griffinmartin/opencode-claude-auth/compare/v1.5.0...v1.5.1) (2026-04-30)
+
+
+### Bug Fixes
+
+* restore Claude subscription auth parity for Claude Code 2.1.112 ([#207](https://github.com/griffinmartin/opencode-claude-auth/issues/207)) ([572f94c](https://github.com/griffinmartin/opencode-claude-auth/commit/572f94c3869eb2d17c87f2d6f6f8e87d05b21af5))
+
 ## [1.5.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v1.4.10...v1.5.0) (2026-04-16)
 
 

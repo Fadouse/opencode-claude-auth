@@ -550,21 +550,27 @@ cch=00000
 以下理论都已被明确否定：
 
 ### 12.1 `cch = SHA256(body)[:5]`
+
 否。
 
 ### 12.2 `cch = SHA256(zeroed_body)[:5]`
+
 否。
 
 ### 12.3 `cch = MD5/CRC32/Adler32/BLAKE2s(body or ids)[:5]`
+
 否。
 
 ### 12.4 `cch = request-id 的简单哈希`
+
 否。
 
 ### 12.5 `cch = session-id 的简单哈希`
+
 否。
 
 ### 12.6 `cch = 无 seed 的 XXH64(body)`
+
 否。
 
 只有以下说法被 runtime + static 双重证据支持：

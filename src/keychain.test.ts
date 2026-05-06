@@ -427,7 +427,9 @@ describe("credentials file fallback", () => {
 
   it("can read persisted identity fields from ~/.claude.json", async () => {
     const originalHome = process.env.HOME
-    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-state-"))
+    const tempHome = await mkdtemp(
+      join(tmpdir(), "opencode-claude-auth-state-"),
+    )
     process.env.HOME = tempHome
 
     try {
@@ -442,7 +444,9 @@ describe("credentials file fallback", () => {
         }),
       )
 
-      const raw = JSON.parse(readFileSync(join(tempHome, ".claude.json"), "utf-8"))
+      const raw = JSON.parse(
+        readFileSync(join(tempHome, ".claude.json"), "utf-8"),
+      )
       assert.equal(
         raw.userID,
         "15c1d59ab656b2590ff73b31b8464c62d2983ffcd53f39f86692021e9d22b44d",

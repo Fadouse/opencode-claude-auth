@@ -124,12 +124,12 @@ describe("signing", () => {
     it("produces a placeholder header for simple string message", () => {
       const result = buildBillingHeaderValue(
         [{ role: "user", content: "hey" }],
-        "2.1.90",
-        "cli",
+        "2.1.126",
+        "sdk-cli",
       )
       assert.equal(
         result,
-        "x-anthropic-billing-header: cc_version=2.1.90.b39; cc_entrypoint=cli; cch=00000;",
+        "x-anthropic-billing-header: cc_version=2.1.126.88c; cc_entrypoint=sdk-cli; cch=00000;",
       )
     })
 
@@ -144,24 +144,25 @@ describe("signing", () => {
             ],
           },
         ],
-        "2.1.90",
-        "cli",
+        "2.1.126",
+        "sdk-cli",
       )
       assert.equal(
         result,
-        "x-anthropic-billing-header: cc_version=2.1.90.b39; cc_entrypoint=cli; cch=00000;",
+        "x-anthropic-billing-header: cc_version=2.1.126.88c; cc_entrypoint=sdk-cli; cch=00000;",
       )
     })
 
     it("handles missing user message with the placeholder slot", () => {
-      const result = buildBillingHeaderValue([], "2.1.90", "cli")
+      const result = buildBillingHeaderValue([], "2.1.126", "sdk-cli")
       assert.ok(result.includes("cch=00000"))
+      assert.ok(result.includes("cc_version=2.1.126.88c"))
     })
 
     it("uses provided entrypoint", () => {
       const result = buildBillingHeaderValue(
         [{ role: "user", content: "hey" }],
-        "2.1.90",
+        "2.1.126",
         "sdk-cli",
       )
       assert.ok(result.includes("cc_entrypoint=sdk-cli"))

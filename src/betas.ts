@@ -50,7 +50,9 @@ export function isLongContextError(responseBody: string): boolean {
   return (
     responseBody.includes(
       "Extra usage is required for long context requests",
-    ) || responseBody.includes("long context beta is not yet available")
+    ) ||
+    responseBody.includes("long context beta is not yet available") ||
+    responseBody.includes("You're out of extra usage")
   )
 }
 
@@ -156,7 +158,5 @@ export function getBedrockExtraBodyParamsBetas(modelId: string): string[] {
     }
   }
 
-  return betas.filter((beta) =>
-    BEDROCK_EXTRA_BODY_PARAMS_BETAS.has(beta),
-  )
+  return betas.filter((beta) => BEDROCK_EXTRA_BODY_PARAMS_BETAS.has(beta))
 }

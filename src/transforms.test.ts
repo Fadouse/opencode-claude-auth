@@ -104,7 +104,7 @@ describe("transforms", () => {
 
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.ok(
-      parsed.system[0].text.includes("cc_version=2.1.116."),
+      parsed.system[0].text.includes("cc_version=2.1.126."),
       `Expected updated cc_version in billing header, got: ${parsed.system[0].text}`,
     )
     assert.match(
@@ -185,7 +185,9 @@ describe("transforms", () => {
     const output = transformBody(
       JSON.stringify({
         system: [{ type: "text", text: "extra text" }],
-        messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        messages: [
+          { role: "user", content: [{ type: "text", text: "hello" }] },
+        ],
       }),
     )
 
@@ -244,7 +246,9 @@ describe("transforms", () => {
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.equal(parsed.system[1].text, identity)
     assert.equal(parsed.system.length, 2)
-    assert.ok(parsed.messages[0].content.includes("Working directory: /home/test"))
+    assert.ok(
+      parsed.messages[0].content.includes("Working directory: /home/test"),
+    )
   })
 
   it("transformBody preserves identity without cache_control and relocates remainder", () => {
@@ -350,8 +354,16 @@ describe("transforms", () => {
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.equal(parsed.system[1].text, identity)
     assert.equal(parsed.messages[0].content[0].type, "text")
-    assert.ok(parsed.messages[0].content[0].text?.includes("Custom instructions block A"))
-    assert.ok(parsed.messages[0].content[0].text?.includes("Custom instructions block B"))
+    assert.ok(
+      parsed.messages[0].content[0].text?.includes(
+        "Custom instructions block A",
+      ),
+    )
+    assert.ok(
+      parsed.messages[0].content[0].text?.includes(
+        "Custom instructions block B",
+      ),
+    )
     assert.equal(parsed.messages[0].content[1].text, "hello")
   })
 
@@ -994,7 +1006,10 @@ describe("transforms", () => {
 
       const output = transformBody(input)
       const parsed = JSON.parse(output as string) as {
-        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+        system: Array<{
+          text: string
+          cache_control?: { type: string; ttl?: string; scope?: string }
+        }>
       }
 
       // Billing header (system[0]) should never have cache_control
@@ -1015,7 +1030,10 @@ describe("transforms", () => {
       process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
       const input = JSON.stringify({
         system: [
-          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+          },
         ],
         messages: [{ role: "user", content: "hello" }],
       })
@@ -1044,7 +1062,10 @@ describe("transforms", () => {
 
       const output = transformBody(input)
       const parsed = JSON.parse(output as string) as {
-        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+        system: Array<{
+          text: string
+          cache_control?: { type: string; ttl?: string; scope?: string }
+        }>
       }
 
       // Identity block should keep original cache_control without ttl/scope
@@ -1061,7 +1082,10 @@ describe("transforms", () => {
       process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
       const input = JSON.stringify({
         system: [
-          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+          },
         ],
         tools: [
           { name: "search", cache_control: { type: "ephemeral" } },
@@ -1072,7 +1096,10 @@ describe("transforms", () => {
 
       const output = transformBody(input)
       const parsed = JSON.parse(output as string) as {
-        tools: Array<{ name: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+        tools: Array<{
+          name: string
+          cache_control?: { type: string; ttl?: string; scope?: string }
+        }>
       }
 
       // Tool with existing cache_control should be upgraded
@@ -1093,13 +1120,20 @@ describe("transforms", () => {
       process.env.ANTHROPIC_ENABLE_1H_CACHE_TTL = "true"
       const input = JSON.stringify({
         system: [
-          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          {
+            type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.",
+          },
         ],
         messages: [
           {
             role: "user",
             content: [
-              { type: "text", text: "hello", cache_control: { type: "ephemeral" } },
+              {
+                type: "text",
+                text: "hello",
+                cache_control: { type: "ephemeral" },
+              },
               { type: "text", text: "world" },
             ],
           },
@@ -1110,7 +1144,11 @@ describe("transforms", () => {
       const parsed = JSON.parse(output as string) as {
         messages: Array<{
           role: string
-          content: Array<{ type: string; text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+          content: Array<{
+            type: string
+            text: string
+            cache_control?: { type: string; ttl?: string; scope?: string }
+          }>
         }>
       }
 
@@ -1145,7 +1183,10 @@ describe("transforms", () => {
 
       const output = transformBody(input)
       const parsed = JSON.parse(output as string) as {
-        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+        system: Array<{
+          text: string
+          cache_control?: { type: string; ttl?: string; scope?: string }
+        }>
       }
 
       const identity = parsed.system.find((e) =>
@@ -1153,8 +1194,16 @@ describe("transforms", () => {
       )
       assert.ok(identity, "Expected identity block")
       assert.equal(identity!.cache_control!.type, "other")
-      assert.equal(identity!.cache_control!.ttl, undefined, "Should not add ttl to non-ephemeral")
-      assert.equal(identity!.cache_control!.scope, undefined, "Should not add scope to non-ephemeral")
+      assert.equal(
+        identity!.cache_control!.ttl,
+        undefined,
+        "Should not add ttl to non-ephemeral",
+      )
+      assert.equal(
+        identity!.cache_control!.scope,
+        undefined,
+        "Should not add scope to non-ephemeral",
+      )
     })
 
     it("works with config instead of env var", () => {
@@ -1174,7 +1223,10 @@ describe("transforms", () => {
 
       const output = transformBody(input)
       const parsed = JSON.parse(output as string) as {
-        system: Array<{ text: string; cache_control?: { type: string; ttl?: string; scope?: string } }>
+        system: Array<{
+          text: string
+          cache_control?: { type: string; ttl?: string; scope?: string }
+        }>
       }
 
       const identity = parsed.system.find((e) =>

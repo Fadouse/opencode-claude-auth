@@ -289,6 +289,25 @@ describe("betas", () => {
     assert.ok(!isLongContextError(""), "should not match empty string")
   })
 
+  it("isLongContextError detects out-of-extra-usage error (Max subscription quota)", () => {
+    assert.ok(
+      isLongContextError("You're out of extra usage"),
+      "should detect out-of-extra-usage error",
+    )
+    assert.ok(
+      isLongContextError(
+        "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
+      ),
+      "should detect full out-of-extra-usage message",
+    )
+    assert.ok(
+      isLongContextError(
+        '{"error": {"message": "You\'re out of extra usage. Add more at claude.ai/settings/usage and keep going."}}',
+      ),
+      "should detect out-of-extra-usage error in JSON",
+    )
+  })
+
   it("getModelBetas uses ANTHROPIC_BETA_FLAGS when set", () => {
     process.env.ANTHROPIC_BETA_FLAGS = "custom-beta-1,custom-beta-2"
     try {
@@ -350,7 +369,10 @@ describe("betas", () => {
       process.env.ANTHROPIC_API_PROVIDER = "bedrock"
 
       const expected = unfilteredBetas.filter((beta) => !fullBetas.has(beta))
-      assert.deepEqual(getBedrockExtraBodyParamsBetas("claude-sonnet-4-6"), expected)
+      assert.deepEqual(
+        getBedrockExtraBodyParamsBetas("claude-sonnet-4-6"),
+        expected,
+      )
     } finally {
       if (typeof originalProvider === "string") {
         process.env.ANTHROPIC_API_PROVIDER = originalProvider

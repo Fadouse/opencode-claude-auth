@@ -1,7 +1,4 @@
-import {
-  buildBillingHeaderValue,
-  fillCchInSerializedBody,
-} from "./signing.ts"
+import { buildBillingHeaderValue, fillCchInSerializedBody } from "./signing.ts"
 import { config, getModelOverride } from "./model-config.ts"
 import { isEnable1hCacheTTL } from "./plugin-config.ts"
 
@@ -162,8 +159,6 @@ export function repairToolPairs(messages: Message[]): Message[] {
     )
 }
 
-const BILLING_HEADER_PREFIX = "x-anthropic-billing-header"
-
 type CacheControl = { type: string; ttl?: string; scope?: string }
 
 /**
@@ -248,7 +243,7 @@ export function transformBody(
 
     // --- Billing header: inject as system[0] (no cache_control) ---
     const version = process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion
-    const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? "cli"
+    const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? "sdk-cli"
     const billingHeader = buildBillingHeaderValue(
       (parsed.messages ?? []) as Array<{
         role?: string
@@ -393,11 +388,13 @@ export function transformBody(
     }
 
     // Upgrade cache_control blocks with 1h TTL + global scope when enabled
-    applyCacheControlUpgrades(parsed as {
-      system?: SystemEntry[]
-      tools?: Array<Record<string, unknown>>
-      messages?: Message[]
-    })
+    applyCacheControlUpgrades(
+      parsed as {
+        system?: SystemEntry[]
+        tools?: Array<Record<string, unknown>>
+        messages?: Message[]
+      },
+    )
 
     return fillCchInSerializedBody(JSON.stringify(parsed))
   } catch {

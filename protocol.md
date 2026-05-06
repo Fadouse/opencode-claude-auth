@@ -192,11 +192,13 @@ This is the current best-supported placement model:
 Recovered official builder family, recorded in `protocl.md`:
 
 ```js
-function W6H(){
-  let extra = {}, raw = process.env.CLAUDE_CODE_EXTRA_METADATA;
+function W6H() {
+  let extra = {},
+    raw = process.env.CLAUDE_CODE_EXTRA_METADATA
   if (raw) {
-    let parsed = E_(raw, false);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) extra = parsed;
+    let parsed = E_(raw, false)
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+      extra = parsed
   }
   return {
     user_id: gH({
@@ -204,7 +206,7 @@ function W6H(){
       device_id: $S(),
       account_uuid: h9()?.accountUuid ?? "",
       session_id: V$(),
-    })
+    }),
   }
 }
 ```

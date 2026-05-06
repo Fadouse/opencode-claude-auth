@@ -11,10 +11,7 @@ import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { afterEach, before, describe, it } from "node:test"
 import { pathToFileURL } from "node:url"
-import {
-  applyOpencodeConfig,
-  resetPluginSettings,
-} from "./plugin-config.ts"
+import { applyOpencodeConfig, resetPluginSettings } from "./plugin-config.ts"
 
 interface ClaudeCredentials {
   accessToken: string
@@ -283,7 +280,10 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     assert.equal(headers.get("x-api-key"), null)
     assert.equal(headers.get("x-custom"), "keep-me")
     assert.equal(headers.get("x-app"), "cli")
-    assert.equal(headers.get("anthropic-dangerous-direct-browser-access"), "true")
+    assert.equal(
+      headers.get("anthropic-dangerous-direct-browser-access"),
+      "true",
+    )
     assert.equal(headers.get("x-stainless-arch"), "x64")
     assert.equal(headers.get("x-stainless-lang"), "js")
     assert.equal(headers.get("x-stainless-os"), "Linux")
@@ -293,6 +293,15 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     assert.equal(headers.get("x-stainless-runtime-version"), "v24.3.0")
     assert.equal(headers.get("x-stainless-timeout"), "600")
     assert.ok(headers.get("anthropic-beta")?.includes("custom-beta"))
+    assert.ok(
+      headers.get("anthropic-beta")?.includes("advisor-tool-2026-03-01"),
+    )
+    assert.equal(
+      headers.get("anthropic-dangerous-direct-browser-access"),
+      "true",
+    )
+    assert.equal(headers.get("x-stainless-lang"), "js")
+    assert.equal(headers.get("x-stainless-runtime"), "node")
     assert.equal(
       headers.get("x-anthropic-billing-header"),
       null,
@@ -385,6 +394,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         headers.get("user-agent")?.includes("9.9.9"),
         `Expected user-agent to include 9.9.9, got: ${headers.get("user-agent")}`,
       )
+      assert.ok(headers.get("user-agent")?.includes("sdk-cli"))
     } finally {
       delete process.env.ANTHROPIC_CLI_VERSION
     }
@@ -405,7 +415,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
-  it("buildRequestHeaders defaults to official CLI version 2.1.116", () => {
+  it("buildRequestHeaders defaults to official CLI version 2.1.126", () => {
     const headers = helpers.buildRequestHeaders(
       "https://api.anthropic.com/v1/messages",
       { headers: {} },
@@ -414,7 +424,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     )
     assert.equal(
       headers.get("user-agent"),
-      "claude-cli/2.1.116 (external, cli)",
+      "claude-cli/2.1.126 (external, sdk-cli)",
     )
   })
 
@@ -438,9 +448,27 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         billing.includes("cc_version=9.9.9"),
         `Expected billing header to include 9.9.9, got: ${billing}`,
       )
+      assert.ok(
+        billing.includes("cc_entrypoint=sdk-cli"),
+        `Expected billing header to include sdk-cli, got: ${billing}`,
+      )
     } finally {
       delete process.env.ANTHROPIC_CLI_VERSION
     }
+  })
+
+  it("buildRequestHeaders preserves provided stainless headers", () => {
+    const headers = helpers.buildRequestHeaders(
+      "https://api.anthropic.com/v1/messages",
+      {
+        headers: {
+          "x-stainless-runtime": "custom-runtime",
+        },
+      },
+      "token",
+      "claude-sonnet-4-6",
+    )
+    assert.equal(headers.get("x-stainless-runtime"), "custom-runtime")
   })
 
   it("fetchWithRetry retries on 429 and succeeds", async () => {
@@ -529,6 +557,96 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     await helpers.fetchWithRetry("https://example.com", {}, 3, mockFetch)
     const elapsed = Date.now() - start
     assert.ok(elapsed >= 900, `Expected at least 900ms delay, got ${elapsed}ms`)
+  })
+
+  it("fetchWithRetry returns immediately when retry-after exceeds max delay cap", async () => {
+    // A retry-after of 31s (31,000ms) exceeds the 30,000ms cap and signals a
+    // quota/usage-limit reset, not a transient rate limit. The function must
+    // return the error response immediately rather than waiting and hanging.
+    const start = Date.now()
+    let callCount = 0
+    const mockFetch = (() => {
+      callCount++
+      return Promise.resolve(
+        new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "31" },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const res = await helpers.fetchWithRetry(
+      "https://example.com",
+      {},
+      3,
+      mockFetch,
+    )
+    const elapsed = Date.now() - start
+    assert.equal(res.status, 429)
+    assert.equal(callCount, 1, "should not retry when delay exceeds cap")
+    assert.ok(elapsed < 5000, `Expected immediate return, got ${elapsed}ms`)
+  })
+
+  it("fetchWithRetry respects OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS env override", async () => {
+    // Override the cap below the natural retry-after delay so the env var
+    // demonstrably changes behaviour: a `retry-after: 1` produces a 1000ms
+    // delay, which exceeds the 500ms override cap, so the function must
+    // bail immediately. Without the override the default 30s cap would
+    // permit the retry and elapsed would be ~1000ms — the gap is what
+    // proves the env var took effect.
+    process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS = "500"
+    let callCount = 0
+    const mockFetch = (() => {
+      callCount++
+      return Promise.resolve(
+        new Response("rate limited", {
+          status: 429,
+          headers: { "retry-after": "1" },
+        }),
+      )
+    }) as unknown as typeof fetch
+    try {
+      const start = Date.now()
+      const res = await helpers.fetchWithRetry(
+        "https://example.com",
+        {},
+        3,
+        mockFetch,
+      )
+      const elapsed = Date.now() - start
+      assert.equal(res.status, 429)
+      assert.equal(
+        callCount,
+        1,
+        "should not retry when delay exceeds env-override cap",
+      )
+      assert.ok(elapsed < 500, `expected immediate return, got ${elapsed}ms`)
+    } finally {
+      delete process.env.OPENCODE_CLAUDE_AUTH_MAX_RETRY_MS
+    }
+  })
+
+  it("fetchWithRetry still retries when retry-after is within the delay cap", async () => {
+    let callCount = 0
+    const mockFetch = (() => {
+      callCount++
+      if (callCount === 1) {
+        return Promise.resolve(
+          new Response("rate limited", {
+            status: 429,
+            headers: { "retry-after": "1" },
+          }),
+        )
+      }
+      return Promise.resolve(new Response("ok", { status: 200 }))
+    }) as unknown as typeof fetch
+    const res = await helpers.fetchWithRetry(
+      "https://example.com",
+      {},
+      3,
+      mockFetch,
+    )
+    assert.equal(res.status, 200)
+    assert.equal(callCount, 2, "should retry when delay is within cap")
   })
 
   it("fetchWithRetry falls back to default delay when retry-after is non-numeric", async () => {
@@ -704,7 +822,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
       })
 
-      assert.equal(forwardedInput, originalInput)
+      assert.equal(forwardedInput, `${originalInput}?beta=true`)
     } finally {
       Date.now = originalNow
       globalThis.setInterval = originalSetInterval
@@ -724,7 +842,9 @@ describe("plugin exports", () => {
   })
 
   it("exports a separate API key provider plugin alongside ClaudeAuthPlugin", async () => {
-    const mod = await import(pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href)
+    const mod = await import(
+      pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href
+    )
 
     assert.equal(typeof mod.ClaudeAuthPlugin, "function")
     assert.equal(typeof mod.ApiKeyProviderPlugin, "function")
@@ -744,7 +864,9 @@ describe("plugin exports", () => {
       },
     })
 
-    const mod = await import(pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href)
+    const mod = await import(
+      pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href
+    )
     const plugin = await mod.ApiKeyProviderPlugin({} as never)
 
     assert.equal(plugin.auth?.provider, "relay")
@@ -770,7 +892,10 @@ describe("plugin exports", () => {
 
     let bodySeen = ""
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
       bodySeen = typeof init?.body === "string" ? init.body : ""
       return new Response("ok")
     }) as typeof fetch
@@ -783,7 +908,10 @@ describe("plugin exports", () => {
             auth: () => Promise<{ type: "api"; key: string }>,
             provider: { models: Record<string, { cost?: unknown }> },
           ) => Promise<{
-            fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+            fetch: (
+              input: RequestInfo | URL,
+              init?: RequestInit,
+            ) => Promise<Response>
           }>
         }
       }
@@ -855,9 +983,15 @@ describe("custom provider config injection", () => {
       },
     })
 
-    const mod = await import(pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href)
+    const mod = await import(
+      pathToFileURL(new URL("./index.ts", import.meta.url).pathname).href
+    )
     const plugin = await mod.ApiKeyProviderPlugin({} as never)
-    const mutableConfig = {
+    const mutableConfig: {
+      model: string
+      provider: Record<string, unknown>
+      small_model?: string
+    } = {
       model: "relay/claude-opus-4-6",
       provider: {} as Record<string, unknown>,
     }
@@ -873,10 +1007,12 @@ describe("custom provider config injection", () => {
     assert.equal("apiKey" in (relay.options ?? {}), false)
     assert.equal(mutableConfig.small_model, "relay/claude-sonnet-4-6")
     assert.deepEqual(
-      (relay.models?.["claude-sonnet-4-6"] as {
-        reasoning?: boolean
-        variants?: Record<string, unknown>
-      })?.variants,
+      (
+        relay.models?.["claude-sonnet-4-6"] as {
+          reasoning?: boolean
+          variants?: Record<string, unknown>
+        }
+      )?.variants,
       {
         low: { effort: "low" },
         medium: { effort: "medium" },
@@ -890,9 +1026,11 @@ describe("custom provider config injection", () => {
       true,
     )
     assert.equal(
-      (relay.models?.["claude-haiku-4-5-20251001"] as {
-        reasoning?: boolean
-      })?.reasoning,
+      (
+        relay.models?.["claude-haiku-4-5-20251001"] as {
+          reasoning?: boolean
+        }
+      )?.reasoning,
       false,
     )
     assert.equal(

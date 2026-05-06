@@ -96,12 +96,12 @@ export function computeSeededCchHash(bodyBytes: Uint8Array): bigint {
       offset += 8
     }
 
-    hash = (
-      xxh64RotateLeft(value1, 1n) +
-      xxh64RotateLeft(value2, 7n) +
-      xxh64RotateLeft(value3, 12n) +
-      xxh64RotateLeft(value4, 18n)
-    ) & XXH64_MASK
+    hash =
+      (xxh64RotateLeft(value1, 1n) +
+        xxh64RotateLeft(value2, 7n) +
+        xxh64RotateLeft(value3, 12n) +
+        xxh64RotateLeft(value4, 18n)) &
+      XXH64_MASK
     hash = xxh64MergeRound(hash, value1)
     hash = xxh64MergeRound(hash, value2)
     hash = xxh64MergeRound(hash, value3)
@@ -115,19 +115,15 @@ export function computeSeededCchHash(bodyBytes: Uint8Array): bigint {
   while (offset + 8 <= length) {
     const lane = xxh64Round(0n, readUint64LE(bodyBytes, offset))
     hash ^= lane
-    hash = (
-      xxh64RotateLeft(hash, 27n) * XXH64_PRIME_1 +
-      XXH64_PRIME_4
-    ) & XXH64_MASK
+    hash =
+      (xxh64RotateLeft(hash, 27n) * XXH64_PRIME_1 + XXH64_PRIME_4) & XXH64_MASK
     offset += 8
   }
 
   if (offset + 4 <= length) {
     hash ^= (readUint32LE(bodyBytes, offset) * XXH64_PRIME_1) & XXH64_MASK
-    hash = (
-      xxh64RotateLeft(hash, 23n) * XXH64_PRIME_2 +
-      XXH64_PRIME_3
-    ) & XXH64_MASK
+    hash =
+      (xxh64RotateLeft(hash, 23n) * XXH64_PRIME_2 + XXH64_PRIME_3) & XXH64_MASK
     offset += 4
   }
 

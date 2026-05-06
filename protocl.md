@@ -1,31 +1,43 @@
 # Claude Code Internal Marker Analysis
+
 ## Scope
+
 This document records local reverse-engineering findings from the official Claude client binary located at:
+
 - `/home/fadouse/.local/share/claude/versions/2.1.87`
-Primary goals:
+  Primary goals:
+
 1. Determine whether the client appends a suspicious marker directly to outbound user message text.
 2. Reconstruct the algorithm used to derive the marker.
 3. Reconstruct the normal Claude Code request-construction path to Anthropic's Messages API.
 4. Assess the best-supported interpretation of the marker's purpose and placement.
-This report is based on static recovery of readable code/text from the ELF `.bun` payload plus prior transcript/path verification. It is **not** a runtime packet capture.
+   This report is based on static recovery of readable code/text from the ELF `.bun` payload plus prior transcript/path verification. It is **not** a runtime packet capture.
+
 ---
+
 ## High-confidence conclusion
+
 The strongest current evidence shows:
+
 - the client does **not** directly append the recovered marker to `messages[*].content.text`
 - instead, it derives a short prompt-dependent marker from the **first user message text**
 - then wraps that marker inside a header-like string beginning with:
   - `x-anthropic-billing-header: cc_version=2.1.87.<marker>; ...`
 - that string is inserted into the **system prompt path**
 - the final request body then carries it inside the top-level `system` field, not as a literal suffix on the user message text
-Best-supported placement:
+  Best-supported placement:
 - **user message append**: low confidence
 - **system prompt insertion**: high confidence
 - **metadata-only field**: not supported for this marker path
 - **real HTTP header emission for this exact string**: not supported by the recovered call path
+
 ---
+
 ## Recoverable marker algorithm
+
 Recovered helper chain:
-```js
+
+````js
 function iw9(H){
   // returns first user message text
 }
@@ -234,9 +246,10 @@ function W6H(){
     })
   }
 }
-```
+````
 
 High-confidence implications:
+
 - `metadata.user_id` is **not** a plain scalar id.
 - It is a **JSON-stringified object** produced by `gH(...)`.
 - The recovered field composition is:
@@ -248,9 +261,11 @@ High-confidence implications:
 This matches observed official request examples where `metadata.user_id` looked like a JSON string rather than a nested JSON object.
 
 ---
+
 ### Recovered device/session/account getters
 
 Recovered helper roles now support a stronger field-source map:
+
 - `V$()` returns the current in-memory Claude Code `sessionId`.
 - `Os$()` rotates `sessionId` via `randomUUID()`.
 - `$S()` returns the persistent device/install identifier:
@@ -261,18 +276,19 @@ Recovered helper roles now support a stronger field-source map:
 Recovered `$S()` body:
 
 ```js
-function $S(){
-  let state = A$();
-  if (state.userID) return state.userID;
-  let generated = randomBytes(32).toString("hex");
-  x$((s)=>({...s,userID:generated}));
-  return generated;
+function $S() {
+  let state = A$()
+  if (state.userID) return state.userID
+  let generated = randomBytes(32).toString("hex")
+  x$((s) => ({ ...s, userID: generated }))
+  return generated
 }
 ```
 
 This is the strongest current evidence that the local persisted `userID` is actually the request/telemetry `device_id`.
 
 ---
+
 ### Recovered Claude-side API wrapper (`py`)
 
 The main Claude-side client-construction wrapper recovered from the Bun payload is:
@@ -282,6 +298,7 @@ async function py({apiKey, maxRetries, model, fetchOverride, source})
 ```
 
 Visible recovered behavior:
+
 - builds Claude-specific `defaultHeaders` before constructing the Anthropic client
 - includes headers such as:
   - `x-app: cli`
@@ -294,13 +311,16 @@ Visible recovered behavior:
 - configures transport/proxy/TLS via `a1H({ forAnthropicAPI: true })`
 
 Important negative finding:
+
 - in the visible recovered `py -> M34 -> w34 -> j34 -> a1H -> Anthropic SDK` path, there is **no explicit insertion of `x-anthropic-billing-header` as an HTTP header** and no visible nonzero `cch` mutation.
 
 This strengthens the architecture split:
+
 - body/system/metadata shaping happens in Claude-side request builders (`W6H`, `TG$`, `ZG$`, `OM9`, `YM9`, etc.)
 - transport/default headers/auth/proxy happen in `py`, `M34`, `w34`, `j34`, `a1H`, and the lower Anthropic SDK
 
 ---
+
 ### Recovered richer system prompt assembly
 
 Earlier recovery showed that `TG$(marker)` produces the billing-header-like string and that the string enters the top-level `system` path.
@@ -316,6 +336,7 @@ let system = [
 ```
 
 High-confidence implication:
+
 - the official client is not limited to the short identity prefix currently used in the repo runtime transform
 - visible recovered runtime builds `system` from **multiple text blocks**, including the billing string from `TG$(...)` and richer base/system prompt text from `ZG$(...)`
 
@@ -324,6 +345,7 @@ This is stronger evidence for a dynamic multi-block system-prompt assembly than 
 What remains unresolved here is completeness: the recovered visible assembly is more complete than the earlier notes, but static extraction still does not prove every final runtime contributor in final order.
 
 ---
+
 ### Recovered telemetry architecture
 
 Recovered Bun functions show that Claude Code 2.1.87 has a structured first-party telemetry/event pipeline.
@@ -388,6 +410,7 @@ function vw4(){
 ```
 
 Recovered first-party exporter behavior shows:
+
 - logs are converted to final event payloads via `transformLogsToEvents(...)`
 - failed exports are persisted into files prefixed `1p_failed_events.`
 - failed batches are retried with backoff
@@ -397,9 +420,11 @@ Recovered first-party exporter behavior shows:
 This matches local newline-delimited failed-event files under `~/.claude/telemetry`.
 
 ---
+
 ### Telemetry/request metadata overlap
 
 Recovered evidence now supports the following high-confidence relationship:
+
 - request `metadata.user_id` uses:
   - `device_id: $S()`
   - `account_uuid: h9()?.accountUuid`
@@ -407,6 +432,7 @@ Recovered evidence now supports the following high-confidence relationship:
 - telemetry builders/exporters also rely on the same core identifiers from `$S()`, `V$()`, and `_WH(!0)`
 
 Recovered `_WH(!0)` bundle includes:
+
 - `deviceId`
 - `sessionId`
 - `email`
@@ -417,11 +443,13 @@ Recovered `_WH(!0)` bundle includes:
 - `userType: "external"`
 
 Therefore:
+
 - `metadata.user_id` and first-party telemetry are not separate identity systems
 - they are sibling projections of the same Claude Code runtime state
 - `X-Claude-Code-Session-Id`, telemetry `session_id`, and `metadata.user_id.session_id` are best understood as the same session key surfacing in different channels
 
 ---
+
 ### `cch` boundary after deeper Bun tracing
 
 Deeper unpacked-Bun tracing moved the `cch` analysis from a repo-level guess to a stronger official-client boundary.
@@ -429,17 +457,18 @@ Deeper unpacked-Bun tracing moved the `cch` analysis from a repo-level guess to 
 What is directly recovered:
 
 ```js
-function TG$(H){
+function TG$(H) {
   let version = `2.1.87.${H}`,
-      entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? "unknown",
-      cch = " cch=00000;",
-      workload = iP$() ? ` cc_workload=${iP$()};` : "",
-      text = `x-anthropic-billing-header: cc_version=${version}; cc_entrypoint=${entrypoint};${cch}${workload}`;
+    entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? "unknown",
+    cch = " cch=00000;",
+    workload = iP$() ? ` cc_workload=${iP$()};` : "",
+    text = `x-anthropic-billing-header: cc_version=${version}; cc_entrypoint=${entrypoint};${cch}${workload}`
   return text
 }
 ```
 
 What is also directly recovered:
+
 - no explicit `.set(...)`, `.append(...)`, or object-literal insertion of `x-anthropic-billing-header` into visible HTTP header builders
 - no explicit visible mutation of `cch` in:
   - `py(...)`
@@ -450,23 +479,28 @@ What is also directly recovered:
   - lower Anthropic SDK header/body assembly
 
 High-confidence interpretation:
+
 - the recovered visible Claude Code 2.1.87 JS/Bun path contains a **static template** with `cch=00000`
 - if real official traffic sometimes shows nonzero `cch`, that replacement path is **not visible in the recovered JS path documented here**
 
 Current safe boundary:
+
 - **proven**: visible constructor emits `00000`
 - **not proven**: final wire `cch` is always `00000`
 - **unresolved**: where/how observed nonzero `cch` values are produced
 
 ---
+
 ### Updated caution boundary
 
 This addendum still does not prove that:
+
 - the visible `cch=00000` template is identical to every final on-wire request in all runtime paths
 - the currently recovered `system` assembly is the complete final prompt without any additional later-stage contributors
 - telemetry export format and request metadata are identical byte-for-byte across all code paths; only their shared field sources are currently supported
 
 Updated best current interpretation:
+
 - yes, `metadata.user_id` is best understood as a JSON-stringified `{device_id, account_uuid, session_id}` bundle rather than a plain scalar id
 - yes, first-party telemetry and request metadata share the same underlying device/account/session context builders
 - no, the real nonzero `cch` runtime derivation has not yet been recovered from the visible Bun/JS path and should not be guessed

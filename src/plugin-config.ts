@@ -89,10 +89,8 @@ export function applyOpencodeConfig(config: unknown): void {
 
     // Check top-level first, then fall back to options (where OpenCode's
     // Zod transform may relocate unknown keys)
-    const val =
-      agent.enable1mContext ?? options?.enable1mContext
-    const cacheTTLVal =
-      agent.enable1hCacheTTL ?? options?.enable1hCacheTTL
+    const val = agent.enable1mContext ?? options?.enable1mContext
+    const cacheTTLVal = agent.enable1hCacheTTL ?? options?.enable1hCacheTTL
 
     if (typeof val === "boolean" && settings.enable1mContext === undefined) {
       settings.enable1mContext = val

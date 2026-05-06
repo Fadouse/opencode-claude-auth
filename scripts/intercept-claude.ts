@@ -124,6 +124,19 @@ function interceptModel(model: string): Promise<CapturedRequest | null> {
           // body may not be JSON
         }
 
+        const billingHeader = Array.isArray(parsed.system)
+          ? (parsed.system
+              .map((entry) => {
+                if (typeof entry === "string") return entry
+                if (entry && typeof entry === "object" && "text" in entry) {
+                  return typeof entry.text === "string" ? entry.text : ""
+                }
+                return ""
+              })
+              .find((text) => text.startsWith("x-anthropic-billing-header")) ??
+            "")
+          : (headers["x-anthropic-billing-header"] ?? "")
+
         const captured: CapturedRequest = {
           model,
           url: req.url ?? "",
@@ -132,7 +145,7 @@ function interceptModel(model: string): Promise<CapturedRequest | null> {
           bodyKeys: Object.keys(parsed).sort(),
           betas,
           userAgent: headers["user-agent"] ?? "",
-          billingHeader: headers["x-anthropic-billing-header"] ?? "",
+          billingHeader,
           thinking: parsed.thinking,
           metadata: parsed.metadata,
           outputConfig: parsed.output_config,
@@ -253,7 +266,9 @@ function printCapture(capture: CapturedRequest): {
 } {
   console.log(`\n${c.bold(`Model: ${capture.model}`)}`)
   console.log(`${"─".repeat(50)}`)
-  console.log(`\n  ${c.bold("Request")}: ${c.dim(`${capture.method} ${capture.url}`)}`)
+  console.log(
+    `\n  ${c.bold("Request")}: ${c.dim(`${capture.method} ${capture.url}`)}`,
+  )
 
   // Get our effective betas for this model
   const ourBetas = getOurBetas(capture.model)

@@ -207,7 +207,9 @@ describe("plugin-config", () => {
     })
 
     it("loads apiKeyProvider from an opencode.json file before config hook runs", async () => {
-      const tempDir = await mkdtemp(join(tmpdir(), "opencode-claude-auth-config-"))
+      const tempDir = await mkdtemp(
+        join(tmpdir(), "opencode-claude-auth-config-"),
+      )
       const configPath = join(tempDir, "opencode.json")
 
       await writeFile(
@@ -237,7 +239,7 @@ describe("plugin-config", () => {
       })
 
       const contents = await readFile(configPath, "utf8")
-      assert.ok(contents.includes("\"apiKeyProvider\""))
+      assert.ok(contents.includes('"apiKeyProvider"'))
     })
   })
 
