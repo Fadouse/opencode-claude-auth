@@ -69,20 +69,20 @@ describe("signing", () => {
 
   describe("computeCch", () => {
     const bodyText =
-      '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.88.e09; cc_entrypoint=sdk-cli; cch=00000;"}]}'
+      '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.88.e09; cc_entrypoint=cli; cch=00000;"}]}'
 
     it("matches the recovered seeded XXH64 test vector", () => {
       assert.equal(
         computeSeededCchHash(new TextEncoder().encode(bodyText)),
-        0xa1fb9e4e37ea9c0fn,
+        0x415f05b92ae2a528n,
       )
-      assert.equal(computeCch(bodyText), "a9c0f")
+      assert.equal(computeCch(bodyText), "2a528")
     })
 
     it("fills the serialized body placeholder deterministically", () => {
       assert.equal(
         fillCchInSerializedBody(bodyText),
-        '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.88.e09; cc_entrypoint=sdk-cli; cch=a9c0f;"}]}',
+        '{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.88.e09; cc_entrypoint=cli; cch=2a528;"}]}',
       )
     })
   })
@@ -125,11 +125,11 @@ describe("signing", () => {
       const result = buildBillingHeaderValue(
         [{ role: "user", content: "hey" }],
         "2.1.126",
-        "sdk-cli",
+        "cli",
       )
       assert.equal(
         result,
-        "x-anthropic-billing-header: cc_version=2.1.126.88c; cc_entrypoint=sdk-cli; cch=00000;",
+        "x-anthropic-billing-header: cc_version=2.1.126.88c; cc_entrypoint=cli; cch=00000;",
       )
     })
 
@@ -145,16 +145,16 @@ describe("signing", () => {
           },
         ],
         "2.1.126",
-        "sdk-cli",
+        "cli",
       )
       assert.equal(
         result,
-        "x-anthropic-billing-header: cc_version=2.1.126.88c; cc_entrypoint=sdk-cli; cch=00000;",
+        "x-anthropic-billing-header: cc_version=2.1.126.88c; cc_entrypoint=cli; cch=00000;",
       )
     })
 
     it("handles missing user message with the placeholder slot", () => {
-      const result = buildBillingHeaderValue([], "2.1.126", "sdk-cli")
+      const result = buildBillingHeaderValue([], "2.1.126", "cli")
       assert.ok(result.includes("cch=00000"))
       assert.ok(result.includes("cc_version=2.1.126.88c"))
     })
@@ -163,9 +163,9 @@ describe("signing", () => {
       const result = buildBillingHeaderValue(
         [{ role: "user", content: "hey" }],
         "2.1.126",
-        "sdk-cli",
+        "cli",
       )
-      assert.ok(result.includes("cc_entrypoint=sdk-cli"))
+      assert.ok(result.includes("cc_entrypoint=cli"))
     })
   })
 })

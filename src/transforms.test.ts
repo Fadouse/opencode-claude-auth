@@ -107,6 +107,10 @@ describe("transforms", () => {
       parsed.system[0].text.includes("cc_version=2.1.126."),
       `Expected updated cc_version in billing header, got: ${parsed.system[0].text}`,
     )
+    assert.ok(
+      parsed.system[0].text.includes("cc_entrypoint=cli"),
+      `Expected cli entrypoint in billing header, got: ${parsed.system[0].text}`,
+    )
     assert.match(
       parsed.system[0].text,
       /cch=[0-9a-f]{5};$/,
