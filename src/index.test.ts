@@ -394,7 +394,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         headers.get("user-agent")?.includes("9.9.9"),
         `Expected user-agent to include 9.9.9, got: ${headers.get("user-agent")}`,
       )
-      assert.ok(headers.get("user-agent")?.includes("sdk-cli"))
+      assert.ok(headers.get("user-agent")?.includes("cli"))
     } finally {
       delete process.env.ANTHROPIC_CLI_VERSION
     }
@@ -424,7 +424,7 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     )
     assert.equal(
       headers.get("user-agent"),
-      "claude-cli/2.1.126 (external, sdk-cli)",
+      "claude-cli/2.1.126 (external, cli)",
     )
   })
 
@@ -449,8 +449,8 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
         `Expected billing header to include 9.9.9, got: ${billing}`,
       )
       assert.ok(
-        billing.includes("cc_entrypoint=sdk-cli"),
-        `Expected billing header to include sdk-cli, got: ${billing}`,
+        billing.includes("cc_entrypoint=cli"),
+        `Expected billing header to include cli, got: ${billing}`,
       )
     } finally {
       delete process.env.ANTHROPIC_CLI_VERSION
